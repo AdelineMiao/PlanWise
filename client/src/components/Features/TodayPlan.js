@@ -1,8 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import api from '../../Services/openAIservice';
 
+function localDateString(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
 function TodayPlan({ events, journalEntries, onAddEvents, membership }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDateString();
   const learnedDays = useMemo(
     () => new Set(journalEntries.map((entry) => entry.date).filter(Boolean)).size,
     [journalEntries]
