@@ -244,9 +244,9 @@ function inferTimeFromText(text) {
 }
 
 function inferDuration(text) {
+  if (/一个半\s*小时/.test(text)) return 90;
   if (/半\s*小时/.test(text)) return 30;
   if (/(一个|一)\s*小时/.test(text)) return 60;
-  if (/一个半\s*小时/.test(text)) return 90;
 
   const chinese = text.match(/(\d+(?:\.\d+)?)\s*(小时|分钟)/);
   if (chinese) {
