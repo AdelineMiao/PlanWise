@@ -719,11 +719,12 @@ const suggestionsSchema = {
 };
 
 app.get('/api/ai-diagnostic', async (req, res) => {
-  if (!process.env.OPENAI_API_KEY) {
+  if (!aiApiKey) {
     return res.status(503).json({
       ok: false,
+      provider: aiProvider,
       model: aiModel,
-      error: 'OPENAI_API_KEY is not configured.',
+      error: 'No AI API key is configured.',
     });
   }
 
@@ -746,11 +747,13 @@ app.get('/api/ai-diagnostic', async (req, res) => {
 
     return res.json({
       ok: Boolean(result && result.ok),
+      provider: aiProvider,
       model: aiModel,
     });
   } catch (error) {
     return res.status(502).json({
       ok: false,
+      provider: aiProvider,
       model: aiModel,
       error: error.message,
     });
