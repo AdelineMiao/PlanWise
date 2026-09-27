@@ -200,7 +200,9 @@ function SmartEventEntry({ user, membership, logoutUser }) {
           },
         ]);
       } else {
-        const scheduled = result.scheduled_events || [];
+        const scheduled = (result.scheduled_events || []).slice().sort(
+          (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
+        );
         addEvents(scheduled);
 
         const scheduleSummary = scheduled.length
