@@ -1,8 +1,7 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, momentLocalizer } from 'react-big-calendar';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import moment from 'moment';
-import { format } from 'date-fns';
 import SmartEventEntryHeader from './SmartEventEntryHeader';
 import DailyJournal from './DailyJournal';
 import TodayPlan from './TodayPlan';
@@ -25,9 +24,49 @@ function toCalendarEvent(event, fallbackId) {
   };
 }
 
+function CalendarToolbar({ label, onNavigate, onView, view }) {
+  return (
+    <div className="pw-calendar-toolbar">
+      <div className="pw-toolbar-group">
+        <button className="pw-toolbar-button" onClick={() => onNavigate('TODAY')}>Today</button>
+        <button className="pw-toolbar-button" onClick={() => onNavigate('PREV')}>‹</button>
+        <button className="pw-toolbar-button" onClick={() => onNavigate('NEXT')}>›</button>
+      </div>
+
+      <div className="pw-toolbar-label">{label}</div>
+
+      <div className="pw-toolbar-group pw-view-switcher">
+        {['month', 'week', 'day'].map((item) => (
+          <button
+            key={item}
+            className={`pw-toolbar-button ${view === item ? 'active' : ''}`}
+            onClick={() => onView(item)}
+          >
+            {item.charAt(0).toUpperCase() + item.slice(1)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CalendarEvent({ event }) {
+  const duration = Math.max(0, (event.end.getTime() - event.start.getTime()) / 60000);
+  return (
+    <div
+      className={`pw-calendar-event-content ${duration <= 30 ? 'compact' : ''}`}
+      title={event.title}
+    >
+      {event.title}
+    </div>
+  );
+}
+
 function SmartEventEntry({ user, membership, logoutUser }) {
   const eventKey = `events_${user.username}`;
   const journalKey = `journal_${user.username}`;
+  const splitRef = useRef(null);
+  const chatEndRef = useRef(null);
 
   const [events, setEvents] = useState([]);
   const [journalEntries, setJournalEntries] = useState([]);
@@ -36,12 +75,14 @@ function SmartEventEntry({ user, membership, logoutUser }) {
   const [chatHistory, setChatHistory] = useState([
     {
       sender: 'assistant',
-      text: 'Tell me what is on your plate. I can add appointments, find time for tasks, respect deadlines, and detect calendar conflicts.',
+      text: 'Tell me what is on your plate. I can add appointments, split multiple tasks, respect deadlines, and detect calendar conflicts.',
     },
   ]);
   const [view, setView] = useState('week');
   const [date, setDate] = useState(new Date());
   const [currentFeature, setCurrentFeature] = useState('calendar');
+  const [calendarWidth, setCalendarWidth] = useState(64);
+  const [isResizing, setIsResizing] = useState(false);
 
   useEffect(() => {
     try {
@@ -68,6 +109,32 @@ function SmartEventEntry({ user, membership, logoutUser }) {
   useEffect(() => {
     localStorage.setItem(journalKey, JSON.stringify(journalEntries));
   }, [journalEntries, journalKey]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [chatHistory, isProcessing]);
+
+  useEffect(() => {
+    if (!isResizing) return undefined;
+
+    const handlePointerMove = (event) => {
+      if (!splitRef.current) return;
+      const rect = splitRef.current.getBoundingClientRect();
+      const nextWidth = ((event.clientX - rect.left) / rect.width) * 100;
+      setCalendarWidth(Math.max(42, Math.min(76, nextWidth)));
+    };
+
+    const stopResizing = () => setIsResizing(false);
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResizing);
+    document.body.classList.add('pw-resizing');
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResizing);
+      document.body.classList.remove('pw-resizing');
+    };
+  }, [isResizing]);
 
   const learnedDays = useMemo(
     () => new Set(journalEntries.map((entry) => entry.date).filter(Boolean)).size,
@@ -117,6 +184,10 @@ function SmartEventEntry({ user, membership, logoutUser }) {
     try {
       const result = await api.planRequest(message, events);
 
+      if (result.planner_mode === 'fallback' && result.ai_error) {
+        console.warn('PlanWise AI request fell back to local parsing:', result.ai_error);
+      }
+
       if (result.action === 'cancel') {
         const count = cancelMatching(result.cancellation_query || message);
         setChatHistory((previous) => [
@@ -129,24 +200,28 @@ function SmartEventEntry({ user, membership, logoutUser }) {
           },
         ]);
       } else {
-        addEvents(result.scheduled_events || []);
+        const scheduled = result.scheduled_events || [];
+        addEvents(scheduled);
 
-        const scheduledCount = result.scheduled_events?.length || 0;
-        const conflictCount = result.conflicts?.length || 0;
-        const unscheduledCount = result.unscheduled?.length || 0;
+        const scheduleSummary = scheduled.length
+          ? scheduled
+              .map((item) => {
+                const start = new Date(item.start);
+                return `• ${item.title} — ${start.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+              })
+              .join('\n')
+          : '';
 
-        const details = [
-          result.assistant_message,
-          scheduledCount ? `Scheduled ${scheduledCount} item(s).` : '',
-          conflictCount ? `${conflictCount} conflict(s) need attention.` : '',
-          unscheduledCount ? `${unscheduledCount} item(s) could not be placed automatically.` : '',
+        const extra = [
+          result.conflicts?.length ? `${result.conflicts.length} conflict(s) need attention.` : '',
+          result.unscheduled?.length ? `${result.unscheduled.length} item(s) could not be placed automatically.` : '',
         ].filter(Boolean).join(' ');
 
         setChatHistory((previous) => [
           ...previous,
           {
             sender: 'assistant',
-            text: details || 'I updated your plan.',
+            text: [result.assistant_message, scheduleSummary, extra].filter(Boolean).join('\n'),
           },
         ]);
       }
@@ -175,127 +250,165 @@ function SmartEventEntry({ user, membership, logoutUser }) {
   const eventStyleGetter = (event) => {
     if (event.conflict) {
       return {
-        style: {
-          backgroundColor: '#DC2626',
-          borderRadius: '6px',
-          border: 'none',
-        },
+        className: 'pw-event-conflict',
+        style: { backgroundColor: '#ff453a' },
       };
     }
 
     if (event.kind === 'task') {
       return {
-        style: {
-          backgroundColor: '#4F46E5',
-          borderRadius: '6px',
-          border: 'none',
-        },
+        className: 'pw-event-task',
+        style: { backgroundColor: '#5856d6' },
       };
     }
 
     return {
-      style: {
-        backgroundColor: '#0F766E',
-        borderRadius: '6px',
-        border: 'none',
-      },
+      className: 'pw-event-appointment',
+      style: { backgroundColor: '#0a84ff' },
     };
   };
 
   const renderCalendar = () => (
-    <div className="flex min-h-0 flex-1 flex-col bg-gray-50">
-      <div className="flex-1 min-h-0 p-4 sm:p-6">
-        <div className="flex h-full min-h-[520px] flex-col rounded-2xl bg-white p-4 shadow-sm">
-          <div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-            <div>
-              <p className="text-sm font-medium text-indigo-600">Time Manager</p>
-              <h2 className="text-2xl font-bold text-gray-900">
-                {user?.firstName ? `${user.firstName}'s Calendar` : 'My Calendar'}
-              </h2>
-              <p className="mt-1 text-xs text-gray-500">
-                {learnedDays < 7
-                  ? `PlanWise is learning your routine: ${learnedDays}/7 journal days`
-                  : 'Personalized daily planning is unlocked'}
-              </p>
+    <main className="pw-main-shell">
+      <div className="pw-split-layout" ref={splitRef}>
+        <section
+          className="pw-calendar-pane"
+          style={{ width: `${calendarWidth}%` }}
+        >
+          <div className="pw-panel-card pw-calendar-card">
+            <header className="pw-panel-header">
+              <div>
+                <p className="pw-eyebrow">Time Manager</p>
+                <h2 className="pw-panel-title">
+                  {user?.firstName ? `${user.firstName}'s Calendar` : 'My Calendar'}
+                </h2>
+                <p className="pw-panel-subtitle">
+                  {learnedDays < 7
+                    ? `Learning your routine: ${learnedDays}/7 journal days`
+                    : 'Personalized daily planning is unlocked'}
+                </p>
+              </div>
+
+              <button className="pw-clear-button" onClick={clearAllEvents}>
+                Clear
+              </button>
+            </header>
+
+            <div className="pw-calendar-wrap">
+              <Calendar
+                localizer={localizer}
+                events={events}
+                startAccessor="start"
+                endAccessor="end"
+                views={['month', 'week', 'day']}
+                view={view}
+                date={date}
+                onNavigate={setDate}
+                onView={setView}
+                eventPropGetter={eventStyleGetter}
+                components={{
+                  toolbar: CalendarToolbar,
+                  event: CalendarEvent,
+                }}
+                step={30}
+                timeslots={2}
+                min={new Date(1970, 0, 1, 7, 0, 0)}
+                max={new Date(1970, 0, 1, 22, 0, 0)}
+                scrollToTime={new Date(1970, 0, 1, 8, 0, 0)}
+                popup
+                style={{ height: '100%' }}
+              />
             </div>
-            <button className="btn btn-secondary btn-sm" onClick={clearAllEvents}>
-              Clear calendar
-            </button>
           </div>
+        </section>
 
-          <div className="min-h-0 flex-1">
-            <Calendar
-              localizer={localizer}
-              events={events}
-              startAccessor="start"
-              endAccessor="end"
-              style={{ height: '100%' }}
-              views={['month', 'week', 'day']}
-              view={view}
-              date={date}
-              onNavigate={setDate}
-              onView={setView}
-              eventPropGetter={eventStyleGetter}
-              popup
-            />
-          </div>
+        <div
+          className="pw-resizer"
+          role="separator"
+          aria-label="Resize calendar and chat"
+          onPointerDown={() => setIsResizing(true)}
+        >
+          <span />
         </div>
-      </div>
 
-      <div className="border-t bg-white shadow-lg">
-        <div className="mx-auto max-w-7xl p-4">
-          <div className="mb-3 max-h-40 space-y-2 overflow-y-auto">
-            {chatHistory.slice(-5).map((message, index) => (
-              <div
-                key={index}
-                className={message.sender === 'user' ? 'text-right' : 'text-left'}
-              >
+        <aside className="pw-chat-pane">
+          <div className="pw-panel-card pw-chat-card">
+            <header className="pw-chat-header">
+              <div className="pw-chat-avatar">P</div>
+              <div>
+                <h3 className="pw-chat-title">PlanWise</h3>
+                <p className="pw-panel-subtitle">AI scheduling assistant</p>
+              </div>
+            </header>
+
+            <div className="pw-chat-thread">
+              {chatHistory.map((message, index) => (
                 <div
-                  className={`inline-block max-w-3xl rounded-xl px-3 py-2 text-sm ${
-                    message.sender === 'user'
-                      ? 'bg-primary text-white'
-                      : 'bg-gray-100 text-gray-800'
-                  }`}
+                  key={index}
+                  className={`pw-message-row ${message.sender === 'user' ? 'user' : 'assistant'}`}
                 >
-                  {message.text}
+                  {message.sender === 'assistant' && (
+                    <div className="pw-message-avatar">P</div>
+                  )}
+                  <div
+                    className={`pw-message-bubble ${message.sender === 'user' ? 'user' : 'assistant'}`}
+                  >
+                    {message.text}
+                  </div>
+                </div>
+              ))}
+
+              {isProcessing && (
+                <div className="pw-message-row assistant">
+                  <div className="pw-message-avatar">P</div>
+                  <div className="pw-message-bubble assistant pw-thinking">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            <div className="pw-composer-area">
+              <div className="pw-composer">
+                <textarea
+                  className="pw-composer-input"
+                  rows="3"
+                  placeholder="Tell PlanWise what you need to do..."
+                  value={inputText}
+                  onChange={(event) => setInputText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      handleSubmit();
+                    }
+                  }}
+                  disabled={isProcessing}
+                />
+
+                <div className="pw-composer-footer">
+                  <span className="pw-composer-hint">Enter to plan · Shift+Enter for a new line</span>
+                  <button
+                    className="pw-send-button"
+                    onClick={handleSubmit}
+                    disabled={isProcessing || !inputText.trim()}
+                    aria-label="Send plan request"
+                  >
+                    ↑
+                  </button>
                 </div>
               </div>
-            ))}
+            </div>
           </div>
-
-          <div className="flex gap-2">
-            <textarea
-              className="input min-h-[46px] flex-1 resize-none"
-              rows="1"
-              placeholder="e.g. 周五下午3点去看医生，路上40分钟，上午还要交作业，帮我安排一下"
-              value={inputText}
-              onChange={(event) => setInputText(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                  event.preventDefault();
-                  handleSubmit();
-                }
-              }}
-              disabled={isProcessing}
-            />
-            <button
-              className={`btn btn-primary self-end ${isProcessing ? 'cursor-not-allowed opacity-50' : ''}`}
-              onClick={handleSubmit}
-              disabled={isProcessing || !inputText.trim()}
-            >
-              {isProcessing ? 'Planning...' : 'Plan'}
-            </button>
-          </div>
-          <p className="mt-2 text-xs text-gray-400">
-            Tasks are placed into open time. Fixed-time conflicts are shown in red instead of silently overwritten.
-          </p>
-        </div>
+        </aside>
       </div>
-    </div>
+    </main>
   );
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="pw-app-shell">
       <SmartEventEntryHeader
         user={user}
         logoutUser={logoutUser}
