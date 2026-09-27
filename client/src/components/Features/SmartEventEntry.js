@@ -1,475 +1,435 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, momentLocalizer } from 'react-big-calendar';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import moment from 'moment';
-import { format } from 'date-fns';
 import SmartEventEntryHeader from './SmartEventEntryHeader';
-import HabitRecommendations from './HabitRecommendations';
-import GroupAvailability from './GroupAvailability';
-import AutoTaskScheduler from './AutoTaskScheduler';
-import openAIService from '../../Services/openAIservice';
+import DailyJournal from './DailyJournal';
+import TodayPlan from './TodayPlan';
+import api from '../../Services/openAIservice';
 
-/**
- * Fallback function to parse natural language event text into structured event data
- * @param {string} text - Natural language description of event
- * @returns {Object} - Parsed event data
- */
-function parseEventText(text) {
-  if (!text) return null;
-  
-  const lowerText = text.toLowerCase().trim();
-  
-  // Check if this is a cancellation request
-  if (lowerText.includes('cancel') || lowerText.includes('delete') || lowerText.includes('remove')) {
-    const eventToCancel = text.replace(/cancel|delete|remove/gi, '').trim();
-    return { 
-      action: 'cancel',
-      title: eventToCancel
-    };
-  }
-  
-  // Default values
-  const result = {
-    action: 'add',
-    title: text,
-    start: new Date(),
-    end: new Date(new Date().getTime() + 60 * 60 * 1000), // Default 1 hour
-    location: '',
-    notes: ''
+const localizer = momentLocalizer(moment);
+
+function toCalendarEvent(event, fallbackId) {
+  return {
+    id: event.id || fallbackId || Date.now().toString(),
+    title: event.title || 'Untitled',
+    start: event.start instanceof Date ? event.start : new Date(event.start),
+    end: event.end instanceof Date ? event.end : new Date(event.end),
+    kind: event.kind || 'event',
+    priority: event.priority || 'medium',
+    location: event.location || '',
+    notes: event.notes || '',
+    conflict: Boolean(event.conflict),
+    source: event.source || 'user',
   };
-  
-  // Try to extract date and time information
-  try {
-    // Look for common date patterns
-    let dateAdjusted = false;
-    
-    // Check for "tomorrow"
-    if (lowerText.includes('tomorrow')) {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      result.start = new Date(tomorrow);
-      result.end = new Date(tomorrow.getTime() + 60 * 60 * 1000);
-      dateAdjusted = true;
-    }
-    // Check for "next week"
-    else if (lowerText.includes('next week')) {
-      const nextWeek = new Date();
-      nextWeek.setDate(nextWeek.getDate() + 7);
-      result.start = new Date(nextWeek);
-      result.end = new Date(nextWeek.getTime() + 60 * 60 * 1000);
-      dateAdjusted = true;
-    }
-    // Check for day of the week
-    else {
-      const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-      for (let i = 0; i < days.length; i++) {
-        if (lowerText.includes(days[i])) {
-          const today = new Date();
-          const currentDay = today.getDay();
-          const targetDay = i;
-          let daysToAdd = targetDay - currentDay;
-          if (daysToAdd <= 0) daysToAdd += 7; // Next week
-          
-          const futureDate = new Date();
-          futureDate.setDate(futureDate.getDate() + daysToAdd);
-          result.start = new Date(futureDate);
-          result.end = new Date(futureDate.getTime() + 60 * 60 * 1000);
-          dateAdjusted = true;
-          break;
-        }
-      }
-    }
-    
-    // Look for time information with "at" pattern
-    const timePattern = /at\s+(\d{1,2})(?::(\d{1,2}))?\s*(am|pm)?/i;
-    const timeMatch = lowerText.match(timePattern);
-    
-    if (timeMatch) {
-      let hours = parseInt(timeMatch[1], 10);
-      const minutes = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
-      const period = timeMatch[3] ? timeMatch[3].toLowerCase() : null;
-      
-      // Adjust hours for AM/PM
-      if (period === 'pm' && hours < 12) {
-        hours += 12;
-      } else if (period === 'am' && hours === 12) {
-        hours = 0;
-      }
-      
-      // Set the time
-      result.start.setHours(hours, minutes, 0, 0);
-      result.end = new Date(result.start.getTime() + 60 * 60 * 1000);
-    }
-    
-    // Look for duration patterns
-    const durationPattern = /for\s+(\d+)\s*(hour|hr|hours|hrs)/i;
-    const durationMatch = lowerText.match(durationPattern);
-    
-    if (durationMatch) {
-      const duration = parseInt(durationMatch[1], 10);
-      result.end = new Date(result.start.getTime() + duration * 60 * 60 * 1000);
-    }
-    
-    // Extract location if mentioned with "at" or "in"
-    const locationPattern = /(?:at|in)\s+([^,\.]+)(?:,|\.|$)/i;
-    const locationMatch = lowerText.match(locationPattern);
-    
-    if (locationMatch && !timeMatch) { // Make sure it's not matching the time pattern
-      result.location = locationMatch[1].trim();
-    }
-    
-    // Extract title by removing date/time/location information
-    let title = text;
-    
-    // Remove time information
-    if (timeMatch) {
-      title = title.replace(timeMatch[0], '');
-    }
-    
-    // Remove location information
-    if (locationMatch) {
-      title = title.replace(locationMatch[0], '');
-    }
-    
-    // Remove date-related words
-    const dateWords = ['tomorrow', 'next week', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-    for (const word of dateWords) {
-      if (title.toLowerCase().includes(word)) {
-        title = title.replace(new RegExp(word, 'i'), '');
-      }
-    }
-    
-    // Remove duration information
-    if (durationMatch) {
-      title = title.replace(durationMatch[0], '');
-    }
-    
-    // Clean up the title (remove multiple spaces, trim)
-    title = title.replace(/\s+/g, ' ').trim();
-    
-    // Set the cleaned title if we have one
-    if (title.length > 0) {
-      result.title = title;
-    }
-    
-    return result;
-  } catch (error) {
-    console.error('Error parsing event text:', error);
-    // Return basic event with default values if parsing fails
-    return {
-      action: 'add',
-      title: text,
-      start: new Date(),
-      end: new Date(new Date().getTime() + 60 * 60 * 1000),
-      location: '',
-      notes: ''
-    };
-  }
+}
+
+function CalendarToolbar({ label, onNavigate, onView, view }) {
+  return (
+    <div className="pw-calendar-toolbar">
+      <div className="pw-toolbar-group">
+        <button className="pw-toolbar-button" onClick={() => onNavigate('TODAY')}>Today</button>
+        <button className="pw-toolbar-button" onClick={() => onNavigate('PREV')}>‹</button>
+        <button className="pw-toolbar-button" onClick={() => onNavigate('NEXT')}>›</button>
+      </div>
+
+      <div className="pw-toolbar-label">{label}</div>
+
+      <div className="pw-toolbar-group pw-view-switcher">
+        {['month', 'week', 'day'].map((item) => (
+          <button
+            key={item}
+            className={`pw-toolbar-button ${view === item ? 'active' : ''}`}
+            onClick={() => onView(item)}
+          >
+            {item.charAt(0).toUpperCase() + item.slice(1)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CalendarEvent({ event }) {
+  const duration = Math.max(0, (event.end.getTime() - event.start.getTime()) / 60000);
+  return (
+    <div
+      className={`pw-calendar-event-content ${duration <= 30 ? 'compact' : ''}`}
+      title={event.title}
+    >
+      {event.title}
+    </div>
+  );
 }
 
 function SmartEventEntry({ user, membership, logoutUser }) {
+  const eventKey = `events_${user.username}`;
+  const journalKey = `journal_${user.username}`;
+  const splitRef = useRef(null);
+  const chatEndRef = useRef(null);
+
   const [events, setEvents] = useState([]);
+  const [journalEntries, setJournalEntries] = useState([]);
   const [inputText, setInputText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [chatHistory, setChatHistory] = useState([
     {
       sender: 'assistant',
-      text: 'Welcome to PlanWise! Try typing something like "Dinner with Sam tomorrow at 7pm" or "cancel Dinner with Sam" to remove an event.'
-    }
+      text: 'Tell me what is on your plate. I can add appointments, split multiple tasks, respect deadlines, and detect calendar conflicts.',
+    },
   ]);
-  const [view, setView] = useState('month');
+  const [view, setView] = useState('week');
   const [date, setDate] = useState(new Date());
   const [currentFeature, setCurrentFeature] = useState('calendar');
-  
-  // Load saved events from localStorage based on user ID
+  const [calendarWidth, setCalendarWidth] = useState(64);
+  const [isResizing, setIsResizing] = useState(false);
+
   useEffect(() => {
-    if (user) {
-      const userEvents = localStorage.getItem(`events_${user.username}`);
-      if (userEvents) {
-        // Convert string dates back to Date objects
-        const parsedEvents = JSON.parse(userEvents).map(event => ({
-          ...event,
-          start: new Date(event.start),
-          end: new Date(event.end)
-        }));
-        setEvents(parsedEvents);
-      }
-    }
-  }, [user]);
-  
-  // Save events to localStorage when updated
-  useEffect(() => {
-    if (user && events) {
-      localStorage.setItem(`events_${user.username}`, JSON.stringify(events));
-    }
-  }, [events, user]);
-  
-  const handleInputChange = (e) => {
-    setInputText(e.target.value);
-  };
-  
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && inputText.trim()) {
-      handleSubmit();
-    }
-  };
-  
-  const handleSubmit = async () => {
-    if (!inputText.trim() || isProcessing) return;
-    
-    // Add user message to chat
-    setChatHistory(prev => [
-      ...prev,
-      { sender: 'user', text: inputText }
-    ]);
-    
-    setIsProcessing(true);
-    
     try {
-      // Try using OpenAI service first
-      let processedEvent;
-      try {
-        processedEvent = await openAIService.parseEventText(inputText);
-        console.log("OpenAI response:", processedEvent); // Debug log
-      } catch (openAIError) {
-        console.error("OpenAI service failed:", openAIError);
-        // Fall back to local parsing
-        processedEvent = parseEventText(inputText);
-        console.log("Fallback parsing:", processedEvent); // Debug log
+      const savedEvents = JSON.parse(localStorage.getItem(eventKey) || '[]');
+      setEvents(savedEvents.map((event, index) => toCalendarEvent(event, `saved-${index}`)));
+    } catch (error) {
+      console.error('Could not load saved events:', error);
+      setEvents([]);
+    }
+
+    try {
+      const savedJournal = JSON.parse(localStorage.getItem(journalKey) || '[]');
+      setJournalEntries(Array.isArray(savedJournal) ? savedJournal : []);
+    } catch (error) {
+      console.error('Could not load journal:', error);
+      setJournalEntries([]);
+    }
+  }, [eventKey, journalKey]);
+
+  useEffect(() => {
+    localStorage.setItem(eventKey, JSON.stringify(events));
+  }, [events, eventKey]);
+
+  useEffect(() => {
+    localStorage.setItem(journalKey, JSON.stringify(journalEntries));
+  }, [journalEntries, journalKey]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [chatHistory, isProcessing]);
+
+  useEffect(() => {
+    if (!isResizing) return undefined;
+
+    const handlePointerMove = (event) => {
+      if (!splitRef.current) return;
+      const rect = splitRef.current.getBoundingClientRect();
+      const nextWidth = ((event.clientX - rect.left) / rect.width) * 100;
+      setCalendarWidth(Math.max(42, Math.min(76, nextWidth)));
+    };
+
+    const stopResizing = () => setIsResizing(false);
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResizing);
+    document.body.classList.add('pw-resizing');
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResizing);
+      document.body.classList.remove('pw-resizing');
+    };
+  }, [isResizing]);
+
+  const learnedDays = useMemo(
+    () => new Set(journalEntries.map((entry) => entry.date).filter(Boolean)).size,
+    [journalEntries]
+  );
+
+  const addEvents = (incoming) => {
+    const now = Date.now();
+    const normalized = incoming
+      .map((event, index) => toCalendarEvent(event, `ai-${now}-${index}`))
+      .filter((event) => !Number.isNaN(event.start.getTime()) && !Number.isNaN(event.end.getTime()));
+
+    setEvents((previous) => [...previous, ...normalized]);
+  };
+
+  const saveJournal = (entry) => {
+    setJournalEntries((previous) => {
+      const withoutToday = previous.filter((item) => item.date !== entry.date);
+      return [entry, ...withoutToday].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    });
+  };
+
+  const cancelMatching = (query) => {
+    const normalized = query.toLowerCase().trim();
+    if (!normalized) return 0;
+
+    const matching = events.filter((event) =>
+      event.title.toLowerCase().includes(normalized) ||
+      normalized.includes(event.title.toLowerCase())
+    );
+
+    if (!matching.length) return 0;
+
+    const ids = new Set(matching.map((event) => event.id));
+    setEvents((previous) => previous.filter((event) => !ids.has(event.id)));
+    return matching.length;
+  };
+
+  const handleSubmit = async () => {
+    const message = inputText.trim();
+    if (!message || isProcessing) return;
+
+    setChatHistory((previous) => [...previous, { sender: 'user', text: message }]);
+    setInputText('');
+    setIsProcessing(true);
+
+    try {
+      const result = await api.planRequest(message, events);
+
+      if (result.planner_mode === 'fallback' && result.ai_error) {
+        console.warn('PlanWise AI request fell back to local parsing:', result.ai_error);
       }
-      
-      if (processedEvent.action === 'cancel') {
-        // Find events with matching title
-        const eventTitle = processedEvent.title;
-        const matchingEvents = events.filter(event => 
-          event.title.toLowerCase().includes(eventTitle.toLowerCase())
-        );
-        
-        if (matchingEvents.length > 0) {
-          // Remove the matching events
-          const updatedEvents = events.filter(event => 
-            !event.title.toLowerCase().includes(eventTitle.toLowerCase())
-          );
-          setEvents(updatedEvents);
-          
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `Removed ${matchingEvents.length} event(s) with the title "${eventTitle}".`
-            }
-          ]);
-        } else {
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `I couldn't find any events matching "${eventTitle}" to cancel.`
-            }
-          ]);
-        }
+
+      if (result.action === 'cancel') {
+        const count = cancelMatching(result.cancellation_query || message);
+        setChatHistory((previous) => [
+          ...previous,
+          {
+            sender: 'assistant',
+            text: count
+              ? `Removed ${count} matching calendar item(s).`
+              : `I could not find a calendar item matching "${result.cancellation_query || message}".`,
+          },
+        ]);
       } else {
-        // Handle event creation
-        const newEvent = {
-          id: Date.now(),
-          title: processedEvent.title || inputText, // Fallback to input if no title
-          start: processedEvent.start,
-          end: processedEvent.end,
-          location: processedEvent.location || '',
-          notes: processedEvent.notes || ''
-        };
-        
-        setEvents(prev => [...prev, newEvent]);
-        
-        // Format the dates for display
-        const startFormatted = format(newEvent.start, 'EEEE, MMMM d, yyyy h:mm a');
-        const endFormatted = format(newEvent.end, 'h:mm a');
-        
-        setChatHistory(prev => [
-          ...prev,
-          { 
-            sender: 'assistant', 
-            text: `Added "${newEvent.title}" to your calendar on ${startFormatted} to ${endFormatted}.`
-          }
+        const scheduled = (result.scheduled_events || []).slice().sort(
+          (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
+        );
+        addEvents(scheduled);
+
+        const scheduleSummary = scheduled.length
+          ? scheduled
+              .map((item) => {
+                const start = new Date(item.start);
+                return `• ${item.title} — ${start.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+              })
+              .join('\n')
+          : '';
+
+        const extra = [
+          result.conflicts?.length ? `${result.conflicts.length} conflict(s) need attention.` : '',
+          result.unscheduled?.length ? `${result.unscheduled.length} item(s) could not be placed automatically.` : '',
+        ].filter(Boolean).join(' ');
+
+        setChatHistory((previous) => [
+          ...previous,
+          {
+            sender: 'assistant',
+            text: [result.assistant_message, scheduleSummary, extra].filter(Boolean).join('\n'),
+          },
         ]);
       }
     } catch (error) {
-      console.error('Error processing event:', error);
-      
-      // Try one more time with the original parsing function
-      try {
-        const fallbackEvent = parseEventText(inputText);
-        
-        if (fallbackEvent.action !== 'cancel') {
-          const newEvent = {
-            id: Date.now(),
-            title: fallbackEvent.title,
-            start: fallbackEvent.start,
-            end: fallbackEvent.end
-          };
-          
-          setEvents(prev => [...prev, newEvent]);
-          
-          const startFormatted = format(newEvent.start, 'EEEE, MMMM d, yyyy h:mm a');
-          const endFormatted = format(newEvent.end, 'h:mm a');
-          
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `Added "${newEvent.title}" to your calendar on ${startFormatted} to ${endFormatted}.`
-            }
-          ]);
-        }
-      } catch (fallbackError) {
-        console.error('Fallback parsing also failed:', fallbackError);
-        setChatHistory(prev => [
-          ...prev,
-          { 
-            sender: 'assistant', 
-            text: 'Sorry, I had trouble understanding that. Could you try rephrasing?'
-          }
-        ]);
-      }
+      console.error('Plan request failed:', error);
+      setChatHistory((previous) => [
+        ...previous,
+        {
+          sender: 'assistant',
+          text: error.response?.data?.error || 'I could not process that request. Please try again.',
+        },
+      ]);
     } finally {
       setIsProcessing(false);
-      setInputText('');
     }
   };
-  
-  // Handle calendar navigation and view changes
-  const handleNavigate = (newDate) => {
-    setDate(newDate);
-  };
-  
-  const handleViewChange = (newView) => {
-    setView(newView);
-  };
-  
-  // Clear all events function
+
   const clearAllEvents = () => {
     setEvents([]);
-    localStorage.removeItem(`events_${user.username}`);
-    setChatHistory(prev => [
-      ...prev,
-      { 
-        sender: 'assistant', 
-        text: 'All events have been cleared from your calendar.'
-      }
+    setChatHistory((previous) => [
+      ...previous,
+      { sender: 'assistant', text: 'All calendar items have been cleared.' },
     ]);
   };
-  
-  // Feature selection handler
-  const handleFeatureChange = (featureId) => {
-    setCurrentFeature(featureId);
+
+  const eventStyleGetter = (event) => {
+    if (event.conflict) {
+      return {
+        className: 'pw-event-conflict',
+        style: { backgroundColor: '#ff453a' },
+      };
+    }
+
+    if (event.kind === 'task') {
+      return {
+        className: 'pw-event-task',
+        style: { backgroundColor: '#5856d6' },
+      };
+    }
+
+    return {
+      className: 'pw-event-appointment',
+      style: { backgroundColor: '#0a84ff' },
+    };
   };
-  
-  // Render the appropriate feature component based on selection
-  const renderFeature = () => {
-    switch (currentFeature) {
-      case 'calendar':
-        return (
-          <div className="flex-1 p-6 overflow-hidden">
-            {/* Calendar view */}
-            <div className="bg-white shadow-md rounded-lg p-4 h-full">
-              <div className="flex justify-between items-center mb-4">
-                <h1 className="text-2xl font-bold">
-                  {user ? `${user.firstName}'s Calendar` : 'My Calendar'}
-                </h1>
-                <button 
-                  className="btn btn-secondary btn-sm"
-                  onClick={clearAllEvents}
-                >
-                  Clear All Events
-                </button>
+
+  const renderCalendar = () => (
+    <main className="pw-main-shell">
+      <div className="pw-split-layout" ref={splitRef}>
+        <section
+          className="pw-calendar-pane"
+          style={{ width: `${calendarWidth}%` }}
+        >
+          <div className="pw-panel-card pw-calendar-card">
+            <header className="pw-panel-header">
+              <div>
+                <p className="pw-eyebrow">Time Manager</p>
+                <h2 className="pw-panel-title">
+                  {user?.firstName ? `${user.firstName}'s Calendar` : 'My Calendar'}
+                </h2>
+                <p className="pw-panel-subtitle">
+                  {learnedDays < 7
+                    ? `Learning your routine: ${learnedDays}/7 journal days`
+                    : 'Personalized daily planning is unlocked'}
+                </p>
               </div>
+
+              <button className="pw-clear-button" onClick={clearAllEvents}>
+                Clear
+              </button>
+            </header>
+
+            <div className="pw-calendar-wrap">
               <Calendar
-                localizer={momentLocalizer(moment)}
+                localizer={localizer}
                 events={events}
                 startAccessor="start"
                 endAccessor="end"
-                style={{ height: 'calc(100% - 40px)' }}
                 views={['month', 'week', 'day']}
                 view={view}
                 date={date}
-                onNavigate={handleNavigate}
-                onView={handleViewChange}
+                onNavigate={setDate}
+                onView={setView}
+                eventPropGetter={eventStyleGetter}
+                components={{
+                  toolbar: CalendarToolbar,
+                  event: CalendarEvent,
+                }}
+                step={30}
+                timeslots={2}
+                min={new Date(1970, 0, 1, 7, 0, 0)}
+                max={new Date(1970, 0, 1, 22, 0, 0)}
+                scrollToTime={new Date(1970, 0, 1, 8, 0, 0)}
                 popup
+                style={{ height: '100%' }}
               />
             </div>
           </div>
-        );
-      
-      case 'habits':
-        return <HabitRecommendations />;
-      
-      case 'group':
-        return <GroupAvailability />;
-      
-      case 'tasks':
-        return <AutoTaskScheduler events={events} />;
-      
-      default:
-        return <div>Feature not found</div>;
-    }
-  };
-    
-  return (
-    <div className="flex flex-col h-screen">
-      <SmartEventEntryHeader 
-        user={user} 
-        logoutUser={logoutUser} 
-        membership={membership} 
-        currentFeature={currentFeature}
-        onFeatureChange={handleFeatureChange}
-      />
-      
-      {renderFeature()}
-      
-      {/* Only show chat interface for calendar feature */}
-      {currentFeature === 'calendar' && (
-        <div className="bg-white shadow-md h-72 border-t">
-          <div className="flex flex-col h-full">
-            <div className="flex-1 p-4 overflow-y-auto">
+        </section>
+
+        <div
+          className="pw-resizer"
+          role="separator"
+          aria-label="Resize calendar and chat"
+          onPointerDown={() => setIsResizing(true)}
+        >
+          <span />
+        </div>
+
+        <aside className="pw-chat-pane">
+          <div className="pw-panel-card pw-chat-card">
+            <header className="pw-chat-header">
+              <div className="pw-chat-avatar">P</div>
+              <div>
+                <h3 className="pw-chat-title">PlanWise</h3>
+                <p className="pw-panel-subtitle">AI scheduling assistant</p>
+              </div>
+            </header>
+
+            <div className="pw-chat-thread">
               {chatHistory.map((message, index) => (
                 <div
                   key={index}
-                  className={`mb-3 ${
-                    message.sender === 'user' ? 'text-right' : 'text-left'
-                  }`}
+                  className={`pw-message-row ${message.sender === 'user' ? 'user' : 'assistant'}`}
                 >
+                  {message.sender === 'assistant' && (
+                    <div className="pw-message-avatar">P</div>
+                  )}
                   <div
-                    className={`inline-block p-3 rounded-lg ${
-                      message.sender === 'user'
-                        ? 'bg-primary text-white'
-                        : 'bg-secondary text-gray-800'
-                    }`}
+                    className={`pw-message-bubble ${message.sender === 'user' ? 'user' : 'assistant'}`}
                   >
                     {message.text}
                   </div>
                 </div>
               ))}
+
+              {isProcessing && (
+                <div className="pw-message-row assistant">
+                  <div className="pw-message-avatar">P</div>
+                  <div className="pw-message-bubble assistant pw-thinking">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
             </div>
-            <div className="p-4 border-t flex">
-              <input
-                type="text"
-                className="flex-1 mr-2 input"
-                placeholder="Add or cancel an event..."
-                value={inputText}
-                onChange={handleInputChange}
-                onKeyPress={handleKeyPress}
-                disabled={isProcessing}
-              />
-              <button
-                className={`btn btn-primary ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                onClick={handleSubmit}
-                disabled={!inputText.trim() || isProcessing}
-              >
-                {isProcessing ? 'Processing...' : 'Send'}
-              </button>
+
+            <div className="pw-composer-area">
+              <div className="pw-composer">
+                <textarea
+                  className="pw-composer-input"
+                  rows="3"
+                  placeholder="Tell PlanWise what you need to do..."
+                  value={inputText}
+                  onChange={(event) => setInputText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      handleSubmit();
+                    }
+                  }}
+                  disabled={isProcessing}
+                />
+
+                <div className="pw-composer-footer">
+                  <span className="pw-composer-hint">Enter to plan · Shift+Enter for a new line</span>
+                  <button
+                    className="pw-send-button"
+                    onClick={handleSubmit}
+                    disabled={isProcessing || !inputText.trim()}
+                    aria-label="Send plan request"
+                  >
+                    ↑
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
+        </aside>
+      </div>
+    </main>
+  );
+
+  return (
+    <div className="pw-app-shell">
+      <SmartEventEntryHeader
+        user={user}
+        logoutUser={logoutUser}
+        membership={membership}
+        currentFeature={currentFeature}
+        onFeatureChange={setCurrentFeature}
+      />
+
+      {currentFeature === 'calendar' && renderCalendar()}
+      {currentFeature === 'journal' && (
+        <DailyJournal entries={journalEntries} onSave={saveJournal} />
+      )}
+      {currentFeature === 'today' && (
+        <TodayPlan
+          events={events}
+          journalEntries={journalEntries}
+          onAddEvents={addEvents}
+          membership={membership}
+        />
       )}
     </div>
   );

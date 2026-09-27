@@ -1,7 +1,7 @@
 {
   "name": "planwise",
-  "version": "1.0.0",
-  "description": "Smart calendar application with natural language processing",
+  "version": "2.0.0",
+  "description": "AI calendar assistant with journal-informed daily planning",
   "private": true,
   "dependencies": {
     "@testing-library/jest-dom": "^5.16.5",
@@ -16,6 +16,9 @@
     "react-router-dom": "^6.10.0",
     "react-scripts": "5.0.1",
     "web-vitals": "^2.1.4"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.17"
   },
   "scripts": {
     "start": "react-scripts start",
