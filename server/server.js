@@ -273,7 +273,46 @@ function isDurationOnlyClause(clause) {
 function conciseFallbackTitle(clause) {
   const normalized = clause
     .replace(/新办的简历/g, '最新版简历')
-    .replace(/新版的简历/g, '最新版简历');
+    .replace(/新版的简历/g, '最新版简历')
+    .trim();
+
+  // Common English interview phrasing.
+  if (/\binterview\b/i.test(normalized)) {
+    const isProductManager = /\b(product manager|product management|pm)\b/i.test(normalized);
+    const isAI = /\bAI\b/i.test(normalized);
+    const byteDance = /\bbyte\s*dance\b/i.test(normalized);
+
+    if (byteDance && isProductManager) {
+      return (isAI ? 'AI ' : '') + 'PM Interview · ByteDance';
+    }
+
+    const companyMatch = normalized.match(
+      /\b(?:by|with)\s+([A-Za-z][A-Za-z0-9 .&-]{1,30}?)(?=\s+(?:at|on|tomorrow|today|next|this)\b|$)/i
+    );
+
+    let role = normalized
+      .replace(/^\s*(also\s+)?/i, '')
+      .replace(/^\s*i\s+(?:have|have an|have a|am having|need to do)\s+/i, '')
+      .replace(/\b(?:today|tomorrow|the day after tomorrow)\b/gi, '')
+      .replace(/\b(?:at|on)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/gi, '')
+      .replace(/\b(?:by|with)\s+[A-Za-z][A-Za-z0-9 .&-]{1,30}?(?=\s+(?:at|on|tomorrow|today|next|this)\b|$)/i, '')
+      .replace(/\binterview\b/i, '')
+      .replace(/\bproduct manager\b/i, 'PM')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const roleTitle = role ? role + ' Interview' : 'Interview';
+    return companyMatch ? roleTitle + ' · ' + companyMatch[1].trim() : roleTitle;
+  }
+
+  // Common English resume / CV submission phrasing.
+  if (/\b(cv|resume)\b/i.test(normalized)) {
+    const isNewVersion = /\b(new version|new|latest|updated|revised)\b/i.test(normalized);
+    if (/\b(submit|send|email|share|remind)\b/i.test(normalized)) {
+      return isNewVersion ? 'Submit new CV' : 'Submit CV';
+    }
+    return isNewVersion ? 'Update CV' : 'CV';
+  }
 
   if (/面试/.test(normalized)) {
     const eventText = normalized
@@ -299,6 +338,10 @@ function conciseFallbackTitle(clause) {
   if (/简历/.test(normalized)) return '更新简历';
 
   const cleaned = normalized
+    .replace(/\b(today|tomorrow|tonight)\b/gi, '')
+    .replace(/\b\d{1,2}(?::\d{2})?\s*(am|pm)\b/gi, '')
+    .replace(/^\s*(also\s+)?/i, '')
+    .replace(/^\s*(i\s+(have|need|want|must|should)\s+(to\s+)?)\s*/i, '')
     .replace(/今天|明天|后天|前一天|前一日|当天/g, '')
     .replace(/早上|上午|中午|下午|晚上/g, '')
     .replace(/\d{1,2}[:：]\d{2}/g, '')
@@ -310,7 +353,7 @@ function conciseFallbackTitle(clause) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  return cleaned.slice(0, 30) || 'Calendar item';
+  return cleaned.slice(0, 32) || 'Calendar item';
 }
 
 function fallbackPlanner(text, referenceLocal) {
@@ -660,6 +703,45 @@ const suggestionsSchema = {
   },
   required: ['summary', 'suggestions'],
 };
+
+app.get('/api/ai-diagnostic', async (req, res) => {
+  if (!process.env.OPENAI_API_KEY) {
+    return res.status(503).json({
+      ok: false,
+      model: openaiModel,
+      error: 'OPENAI_API_KEY is not configured.',
+    });
+  }
+
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ok: { type: 'boolean' },
+    },
+    required: ['ok'],
+  };
+
+  try {
+    const result = await callStructuredAI(
+      'planwise_diagnostic',
+      schema,
+      'Return {"ok": true}.',
+      { ping: 'planwise' }
+    );
+
+    return res.json({
+      ok: Boolean(result && result.ok),
+      model: openaiModel,
+    });
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      model: openaiModel,
+      error: error.message,
+    });
+  }
+});
 
 app.get('/api/health', (req, res) => {
   res.json({
