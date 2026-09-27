@@ -195,6 +195,15 @@ function inferDateFromText(text, reference) {
   return '';
 }
 
+function chineseNumberToInt(value) {
+  const map = {
+    '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+    '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+    '十一': 11, '十二': 12,
+  };
+  return Object.prototype.hasOwnProperty.call(map, value) ? map[value] : NaN;
+}
+
 function inferTimeFromText(text) {
   const english = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
   if (english) {
@@ -211,11 +220,21 @@ function inferTimeFromText(text) {
     return pad(twentyFour[1]) + ':' + pad(twentyFour[2]);
   }
 
-  const chinese = text.match(/(早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点(?:\s*(半|\d{1,2})\s*分?)?/);
-  if (chinese) {
-    let hour = Number(chinese[2]);
-    let minute = chinese[3] === '半' ? 30 : Number(chinese[3] || 0);
-    const period = chinese[1] || '';
+  const chineseDigits = text.match(/(早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点(?:\s*(半|\d{1,2})\s*分?)?/);
+  if (chineseDigits) {
+    let hour = Number(chineseDigits[2]);
+    const minute = chineseDigits[3] === '半' ? 30 : Number(chineseDigits[3] || 0);
+    const period = chineseDigits[1] || '';
+    if ((period === '下午' || period === '晚上') && hour < 12) hour += 12;
+    if (period === '中午' && hour < 11) hour += 12;
+    return pad(hour) + ':' + pad(minute);
+  }
+
+  const chineseWords = text.match(/(早上|上午|中午|下午|晚上)?\s*(十二|十一|十|[一二两三四五六七八九])\s*点(?:\s*(半|[一二三四五六七八九十]+)\s*分?)?/);
+  if (chineseWords) {
+    let hour = chineseNumberToInt(chineseWords[2]);
+    let minute = chineseWords[3] === '半' ? 30 : 0;
+    const period = chineseWords[1] || '';
     if ((period === '下午' || period === '晚上') && hour < 12) hour += 12;
     if (period === '中午' && hour < 11) hour += 12;
     return pad(hour) + ':' + pad(minute);
@@ -225,6 +244,10 @@ function inferTimeFromText(text) {
 }
 
 function inferDuration(text) {
+  if (/半\s*小时/.test(text)) return 30;
+  if (/(一个|一)\s*小时/.test(text)) return 60;
+  if (/一个半\s*小时/.test(text)) return 90;
+
   const chinese = text.match(/(\d+(?:\.\d+)?)\s*(小时|分钟)/);
   if (chinese) {
     const amount = Number(chinese[1]);
@@ -238,6 +261,53 @@ function inferDuration(text) {
   }
 
   return 60;
+}
+
+function isDurationOnlyClause(clause) {
+  const cleaned = clause
+    .replace(/大概|大约|差不多|左右|约/g, '')
+    .replace(/\s+/g, '');
+  return /^(一个半小时|一个小时|一小时|半小时|\d+(?:\.\d+)?小时|\d+分钟)$/.test(cleaned);
+}
+
+function conciseFallbackTitle(clause) {
+  const normalized = clause
+    .replace(/新办的简历/g, '最新版简历')
+    .replace(/新版的简历/g, '最新版简历');
+
+  if (/面试/.test(normalized)) {
+    const companyMatch = normalized.match(/([A-Za-z0-9\u4e00-\u9fa5·]{2,20})(?:的)?面试/);
+    if (companyMatch) {
+      let company = companyMatch[1]
+        .replace(/^(明天|今天|后天|前一天|前一天下午|前一天上午)/, '')
+        .replace(/^(上午|下午|晚上|早上|中午)/, '')
+        .replace(/^\d{1,2}点(?:半)?/, '')
+        .replace(/^(我有一个|我有|我要|我需要|有一个)/, '')
+        .trim();
+      if (company) return company + '面试';
+    }
+    return '面试';
+  }
+
+  if (/简历/.test(normalized) && /(HR|hr|人事)/.test(normalized)) {
+    return '提交最新版简历';
+  }
+
+  if (/简历/.test(normalized)) return '更新简历';
+
+  const cleaned = normalized
+    .replace(/今天|明天|后天|前一天|前一日|当天/g, '')
+    .replace(/早上|上午|中午|下午|晚上/g, '')
+    .replace(/\d{1,2}[:：]\d{2}/g, '')
+    .replace(/\d{1,2}\s*点(?:半|\d{1,2}分)?/g, '')
+    .replace(/(十二|十一|十|[一二两三四五六七八九])\s*点(?:半)?/g, '')
+    .replace(/大概|大约|左右|差不多/g, '')
+    .replace(/我有一个|我有|我要|我需要|我得|需要把|需要|把/g, '')
+    .replace(/[，。；,;]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned.slice(0, 30) || 'Calendar item';
 }
 
 function fallbackPlanner(text, referenceLocal) {
@@ -263,26 +333,84 @@ function fallbackPlanner(text, referenceLocal) {
     };
   }
 
-  const date = inferDateFromText(text, reference);
-  const startTime = inferTimeFromText(text);
-  const duration = inferDuration(text);
+  const clauses = text
+    .split(/[，。；,;]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
 
-  return {
-    action: 'add',
-    cancellation_query: '',
-    assistant_message: 'I added the request using PlanWise fallback parsing.',
-    items: [{
-      title: text.trim(),
+  const items = [];
+  let anchorDate = '';
+
+  for (const clause of clauses) {
+    if (isDurationOnlyClause(clause) && items.length) {
+      items[items.length - 1].duration_min = inferDuration(clause);
+      continue;
+    }
+
+    let clauseDate = '';
+    if (/(前一天|前一日|the day before)/i.test(clause) && anchorDate) {
+      const anchor = parseFloating(anchorDate + 'T00:00');
+      clauseDate = anchor ? dateOnly(addDays(anchor, -1)) : '';
+    }
+
+    if (!clauseDate) {
+      clauseDate = inferDateFromText(clause, reference);
+    }
+
+    const hasExplicitDate = /(今天|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天]|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}月\d{1,2})/i.test(clause);
+    if (hasExplicitDate && clauseDate) anchorDate = clauseDate;
+
+    const startTime = inferTimeFromText(clause);
+    const actionable =
+      Boolean(startTime) ||
+      /(面试|简历|提交|发送|发给|会议|开会|医生|看病|作业|汇报|复习|学习|健身|appointment|interview|meeting|resume|submit|send)/i.test(clause);
+
+    if (!actionable) continue;
+
+    let duration = inferDuration(clause);
+    if (/简历/.test(clause) && !/(小时|分钟|hours?|hrs?|minutes?|mins?)/i.test(clause)) {
+      duration = 30;
+    }
+
+    items.push({
+      title: conciseFallbackTitle(clause),
       kind: startTime ? 'event' : 'task',
-      date,
+      date: clauseDate || anchorDate || dateOnly(reference),
       start_time: startTime,
       duration_min: duration,
       deadline: '',
       priority: 'medium',
       flexible: !startTime,
       location: '',
-      notes: '',
-    }],
+      notes: clause,
+    });
+  }
+
+  if (!items.length) {
+    const date = inferDateFromText(text, reference);
+    const startTime = inferTimeFromText(text);
+    items.push({
+      title: conciseFallbackTitle(text),
+      kind: startTime ? 'event' : 'task',
+      date: date || dateOnly(reference),
+      start_time: startTime,
+      duration_min: inferDuration(text),
+      deadline: '',
+      priority: 'medium',
+      flexible: !startTime,
+      location: '',
+      notes: text,
+    });
+  }
+
+  return {
+    action: 'add',
+    cancellation_query: '',
+    assistant_message:
+      items.length > 1
+        ? 'I separated your request into ' + items.length + ' calendar items.'
+        : 'I added the calendar item.',
+    items,
   };
 }
 
@@ -560,10 +688,15 @@ app.post('/api/plan-request', async (req, res) => {
     'Do not invent obligations. When duration is missing, estimate a conservative duration between 30 and 90 minutes.',
     'If travel time is explicitly mentioned, create a separate task/event for it so the scheduler can reserve the time.',
     'Return action=cancel only when the user is asking to remove an existing calendar item.',
+    'Resolve discourse-relative dates such as 前一天 / the day before against the date of the immediately related appointment when the sentence makes that relationship clear.',
+    'A comma-separated sentence can contain multiple independent obligations. Create one item per obligation instead of copying the whole sentence into one title.',
+    'Titles must be short calendar labels, usually 2 to 8 words or short Chinese phrases. Example: 字节跳动面试, 提交最新版简历. Never use the entire user message as a title.',
     'Keep assistant_message concise and useful.',
   ].join(' ');
 
   let extracted;
+  let plannerMode = 'openai';
+  let aiError = '';
 
   try {
     extracted = await callStructuredAI(
@@ -578,10 +711,13 @@ app.post('/api/plan-request', async (req, res) => {
       }
     );
   } catch (error) {
+    aiError = error.message;
+    plannerMode = 'fallback';
     console.error('AI planner failed, using fallback:', error.message);
   }
 
   if (!extracted) {
+    plannerMode = 'fallback';
     extracted = fallbackPlanner(text, referenceLocal);
   }
 
@@ -607,6 +743,8 @@ app.post('/api/plan-request', async (req, res) => {
     scheduled_events: result.scheduled,
     conflicts: result.conflicts,
     unscheduled: result.unscheduled,
+    planner_mode: plannerMode,
+    ai_error: plannerMode === 'fallback' ? aiError : '',
   });
 });
 
