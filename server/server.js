@@ -7,7 +7,21 @@ const stripeFactory = require('stripe');
 const app = express();
 const port = process.env.PORT || 4000;
 const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-const openaiModel = process.env.OPENAI_MODEL || 'gpt-5.6-luna';
+const aiProvider = (process.env.AI_PROVIDER || 'openai').toLowerCase();
+const aiBaseUrl = (process.env.AI_BASE_URL || (
+  aiProvider === 'deepseek'
+    ? 'https://api.deepseek.com'
+    : 'https://api.openai.com/v1'
+)).replace(/\/$/, '');
+const aiModel = process.env.AI_MODEL || (
+  aiProvider === 'deepseek'
+    ? 'deepseek-flash'
+    : (process.env.OPENAI_MODEL || 'gpt-5.6-luna')
+);
+const aiApiKey = process.env.AI_API_KEY
+  || process.env.DEEPSEEK_API_KEY
+  || process.env.OPENAI_API_KEY
+  || '';
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? stripeFactory(process.env.STRIPE_SECRET_KEY)
@@ -111,16 +125,16 @@ function extractResponseText(data) {
 }
 
 async function callStructuredAI(name, schema, instructions, input) {
-  if (!process.env.OPENAI_API_KEY) return null;
+  if (!aiApiKey) return null;
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
+  const response = await fetch(aiBaseUrl + '/responses', {
     method: 'POST',
     headers: {
-      Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
+      Authorization: 'Bearer ' + aiApiKey,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: openaiModel,
+      model: aiModel,
       instructions,
       input: JSON.stringify(input),
       text: {
@@ -708,7 +722,7 @@ app.get('/api/ai-diagnostic', async (req, res) => {
   if (!process.env.OPENAI_API_KEY) {
     return res.status(503).json({
       ok: false,
-      model: openaiModel,
+      model: aiModel,
       error: 'OPENAI_API_KEY is not configured.',
     });
   }
@@ -732,12 +746,12 @@ app.get('/api/ai-diagnostic', async (req, res) => {
 
     return res.json({
       ok: Boolean(result && result.ok),
-      model: openaiModel,
+      model: aiModel,
     });
   } catch (error) {
     return res.status(502).json({
       ok: false,
-      model: openaiModel,
+      model: aiModel,
       error: error.message,
     });
   }
@@ -746,9 +760,11 @@ app.get('/api/ai-diagnostic', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    aiConfigured: Boolean(process.env.OPENAI_API_KEY),
+    aiConfigured: Boolean(aiApiKey),
+    aiProvider,
+    aiBaseUrl,
     stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
-    model: openaiModel,
+    model: aiModel,
   });
 });
 
