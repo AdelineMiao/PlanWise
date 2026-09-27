@@ -537,6 +537,50 @@ function findOpenSlot({
   return null;
 }
 
+function findLatestOpenSlot({
+  earliest,
+  durationMin,
+  deadline,
+  busy,
+}) {
+  if (!deadline) return null;
+
+  let candidateEnd = new Date(deadline.getTime());
+  const stepMinutes = 15;
+
+  while (candidateEnd > earliest) {
+    const dayStart = setUtcTime(candidateEnd, 8, 0);
+    const dayEnd = setUtcTime(candidateEnd, 21, 0);
+
+    if (candidateEnd > dayEnd) {
+      candidateEnd = dayEnd;
+    }
+
+    const candidateStart = addMinutes(candidateEnd, -durationMin);
+
+    if (candidateStart < dayStart) {
+      const previousDay = addDays(candidateEnd, -1);
+      candidateEnd = setUtcTime(previousDay, 21, 0);
+      continue;
+    }
+
+    if (candidateStart < earliest) return null;
+
+    const collision = busy.find((interval) => overlaps(candidateStart, candidateEnd, interval));
+
+    if (!collision) {
+      return {
+        start: candidateStart,
+        end: candidateEnd,
+      };
+    }
+
+    candidateEnd = addMinutes(collision.start, -stepMinutes);
+  }
+
+  return null;
+}
+
 function scheduleItems(items, existingEvents, referenceLocal) {
   const reference = parseFloating(referenceLocal) || new Date();
   const busy = normalizeExistingEvents(existingEvents);
@@ -605,13 +649,22 @@ function scheduleItems(items, existingEvents, referenceLocal) {
       deadline = setUtcTime(targetDay, 21, 0);
     }
 
-    const slot = findOpenSlot({
-      earliest,
-      durationMin: Math.max(15, item.duration_min || 60),
-      deadline,
-      busy,
-      preferredTime: item.preferred_time || '',
-    });
+    const durationMin = Math.max(15, item.duration_min || 60);
+
+    const slot = item.deadline
+      ? findLatestOpenSlot({
+          earliest,
+          durationMin,
+          deadline,
+          busy,
+        })
+      : findOpenSlot({
+          earliest,
+          durationMin,
+          deadline,
+          busy,
+          preferredTime: item.preferred_time || '',
+        });
 
     if (!slot) {
       unscheduled.push({
@@ -787,7 +840,10 @@ app.post('/api/plan-request', async (req, res) => {
     'The user may mix Chinese and English.',
     'Use the provided reference local datetime and timezone for relative dates.',
     'For fixed appointments, provide date as YYYY-MM-DD and start_time as HH:mm.',
-    'For flexible tasks, leave start_time empty and provide a deadline only when the user states or clearly implies one.',
+    'For flexible tasks, leave start_time empty and provide a deadline when the user states or clearly implies one.',
+    'Phrases such as before the interview, 面试前, by 5pm, 5点前, 截止到, before X are deadlines, not fixed start times. Set start_time to an empty string and set deadline to the exact cutoff.',
+    'When a flexible task refers to an existing calendar event, such as 面试前准备2小时 or prepare for 2 hours before the ByteDance interview, resolve the referenced event from existingEvents and set the task deadline to that event start time.',
+    'Do not choose a fixed start time for deadline-only work unless the user explicitly asks for one.',
     'Deadline format must be YYYY-MM-DDTHH:mm:00 or an empty string.',
     'Do not invent obligations. When duration is missing, estimate a conservative duration between 30 and 90 minutes.',
     'If travel time is explicitly mentioned, create a separate task/event for it so the scheduler can reserve the time.',
