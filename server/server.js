@@ -276,14 +276,17 @@ function conciseFallbackTitle(clause) {
     .replace(/新版的简历/g, '最新版简历');
 
   if (/面试/.test(normalized)) {
-    const companyMatch = normalized.match(/([A-Za-z0-9\u4e00-\u9fa5·]{2,20})(?:的)?面试/);
+    const eventText = normalized
+      .replace(/今天|明天|后天|前一天|前一日/g, '')
+      .replace(/(早上|上午|中午|下午|晚上)?\s*\d{1,2}\s*点(?:半|\d{1,2}\s*分?)?/g, '')
+      .replace(/(早上|上午|中午|下午|晚上)?\s*(十二|十一|十|[一二两三四五六七八九])\s*点(?:半)?/g, '')
+      .replace(/^(我有一个|我有|我要|我需要|有一个)/, '')
+      .replace(/大概|大约|左右/g, '')
+      .trim();
+
+    const companyMatch = eventText.match(/([A-Za-z0-9\u4e00-\u9fa5·]{2,20}?)(?:的)?面试/);
     if (companyMatch) {
-      let company = companyMatch[1]
-        .replace(/^(明天|今天|后天|前一天|前一天下午|前一天上午)/, '')
-        .replace(/^(上午|下午|晚上|早上|中午)/, '')
-        .replace(/^\d{1,2}点(?:半)?/, '')
-        .replace(/^(我有一个|我有|我要|我需要|有一个)/, '')
-        .trim();
+      const company = companyMatch[1].replace(/的$/, '').trim();
       if (company) return company + '面试';
     }
     return '面试';
