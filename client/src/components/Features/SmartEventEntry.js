@@ -1,475 +1,320 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Calendar, momentLocalizer } from 'react-big-calendar';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import moment from 'moment';
 import { format } from 'date-fns';
 import SmartEventEntryHeader from './SmartEventEntryHeader';
-import HabitRecommendations from './HabitRecommendations';
-import GroupAvailability from './GroupAvailability';
-import AutoTaskScheduler from './AutoTaskScheduler';
-import openAIService from '../../Services/openAIservice';
+import DailyJournal from './DailyJournal';
+import TodayPlan from './TodayPlan';
+import api from '../../Services/openAIservice';
 
-/**
- * Fallback function to parse natural language event text into structured event data
- * @param {string} text - Natural language description of event
- * @returns {Object} - Parsed event data
- */
-function parseEventText(text) {
-  if (!text) return null;
-  
-  const lowerText = text.toLowerCase().trim();
-  
-  // Check if this is a cancellation request
-  if (lowerText.includes('cancel') || lowerText.includes('delete') || lowerText.includes('remove')) {
-    const eventToCancel = text.replace(/cancel|delete|remove/gi, '').trim();
-    return { 
-      action: 'cancel',
-      title: eventToCancel
-    };
-  }
-  
-  // Default values
-  const result = {
-    action: 'add',
-    title: text,
-    start: new Date(),
-    end: new Date(new Date().getTime() + 60 * 60 * 1000), // Default 1 hour
-    location: '',
-    notes: ''
+const localizer = momentLocalizer(moment);
+
+function toCalendarEvent(event, fallbackId) {
+  return {
+    id: event.id || fallbackId || Date.now().toString(),
+    title: event.title || 'Untitled',
+    start: event.start instanceof Date ? event.start : new Date(event.start),
+    end: event.end instanceof Date ? event.end : new Date(event.end),
+    kind: event.kind || 'event',
+    priority: event.priority || 'medium',
+    location: event.location || '',
+    notes: event.notes || '',
+    conflict: Boolean(event.conflict),
+    source: event.source || 'user',
   };
-  
-  // Try to extract date and time information
-  try {
-    // Look for common date patterns
-    let dateAdjusted = false;
-    
-    // Check for "tomorrow"
-    if (lowerText.includes('tomorrow')) {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      result.start = new Date(tomorrow);
-      result.end = new Date(tomorrow.getTime() + 60 * 60 * 1000);
-      dateAdjusted = true;
-    }
-    // Check for "next week"
-    else if (lowerText.includes('next week')) {
-      const nextWeek = new Date();
-      nextWeek.setDate(nextWeek.getDate() + 7);
-      result.start = new Date(nextWeek);
-      result.end = new Date(nextWeek.getTime() + 60 * 60 * 1000);
-      dateAdjusted = true;
-    }
-    // Check for day of the week
-    else {
-      const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
-      for (let i = 0; i < days.length; i++) {
-        if (lowerText.includes(days[i])) {
-          const today = new Date();
-          const currentDay = today.getDay();
-          const targetDay = i;
-          let daysToAdd = targetDay - currentDay;
-          if (daysToAdd <= 0) daysToAdd += 7; // Next week
-          
-          const futureDate = new Date();
-          futureDate.setDate(futureDate.getDate() + daysToAdd);
-          result.start = new Date(futureDate);
-          result.end = new Date(futureDate.getTime() + 60 * 60 * 1000);
-          dateAdjusted = true;
-          break;
-        }
-      }
-    }
-    
-    // Look for time information with "at" pattern
-    const timePattern = /at\s+(\d{1,2})(?::(\d{1,2}))?\s*(am|pm)?/i;
-    const timeMatch = lowerText.match(timePattern);
-    
-    if (timeMatch) {
-      let hours = parseInt(timeMatch[1], 10);
-      const minutes = timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
-      const period = timeMatch[3] ? timeMatch[3].toLowerCase() : null;
-      
-      // Adjust hours for AM/PM
-      if (period === 'pm' && hours < 12) {
-        hours += 12;
-      } else if (period === 'am' && hours === 12) {
-        hours = 0;
-      }
-      
-      // Set the time
-      result.start.setHours(hours, minutes, 0, 0);
-      result.end = new Date(result.start.getTime() + 60 * 60 * 1000);
-    }
-    
-    // Look for duration patterns
-    const durationPattern = /for\s+(\d+)\s*(hour|hr|hours|hrs)/i;
-    const durationMatch = lowerText.match(durationPattern);
-    
-    if (durationMatch) {
-      const duration = parseInt(durationMatch[1], 10);
-      result.end = new Date(result.start.getTime() + duration * 60 * 60 * 1000);
-    }
-    
-    // Extract location if mentioned with "at" or "in"
-    const locationPattern = /(?:at|in)\s+([^,\.]+)(?:,|\.|$)/i;
-    const locationMatch = lowerText.match(locationPattern);
-    
-    if (locationMatch && !timeMatch) { // Make sure it's not matching the time pattern
-      result.location = locationMatch[1].trim();
-    }
-    
-    // Extract title by removing date/time/location information
-    let title = text;
-    
-    // Remove time information
-    if (timeMatch) {
-      title = title.replace(timeMatch[0], '');
-    }
-    
-    // Remove location information
-    if (locationMatch) {
-      title = title.replace(locationMatch[0], '');
-    }
-    
-    // Remove date-related words
-    const dateWords = ['tomorrow', 'next week', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-    for (const word of dateWords) {
-      if (title.toLowerCase().includes(word)) {
-        title = title.replace(new RegExp(word, 'i'), '');
-      }
-    }
-    
-    // Remove duration information
-    if (durationMatch) {
-      title = title.replace(durationMatch[0], '');
-    }
-    
-    // Clean up the title (remove multiple spaces, trim)
-    title = title.replace(/\s+/g, ' ').trim();
-    
-    // Set the cleaned title if we have one
-    if (title.length > 0) {
-      result.title = title;
-    }
-    
-    return result;
-  } catch (error) {
-    console.error('Error parsing event text:', error);
-    // Return basic event with default values if parsing fails
-    return {
-      action: 'add',
-      title: text,
-      start: new Date(),
-      end: new Date(new Date().getTime() + 60 * 60 * 1000),
-      location: '',
-      notes: ''
-    };
-  }
 }
 
 function SmartEventEntry({ user, membership, logoutUser }) {
+  const eventKey = `events_${user.username}`;
+  const journalKey = `journal_${user.username}`;
+
   const [events, setEvents] = useState([]);
+  const [journalEntries, setJournalEntries] = useState([]);
   const [inputText, setInputText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [chatHistory, setChatHistory] = useState([
     {
       sender: 'assistant',
-      text: 'Welcome to PlanWise! Try typing something like "Dinner with Sam tomorrow at 7pm" or "cancel Dinner with Sam" to remove an event.'
-    }
+      text: 'Tell me what is on your plate. I can add appointments, find time for tasks, respect deadlines, and detect calendar conflicts.',
+    },
   ]);
-  const [view, setView] = useState('month');
+  const [view, setView] = useState('week');
   const [date, setDate] = useState(new Date());
   const [currentFeature, setCurrentFeature] = useState('calendar');
-  
-  // Load saved events from localStorage based on user ID
+
   useEffect(() => {
-    if (user) {
-      const userEvents = localStorage.getItem(`events_${user.username}`);
-      if (userEvents) {
-        // Convert string dates back to Date objects
-        const parsedEvents = JSON.parse(userEvents).map(event => ({
-          ...event,
-          start: new Date(event.start),
-          end: new Date(event.end)
-        }));
-        setEvents(parsedEvents);
-      }
-    }
-  }, [user]);
-  
-  // Save events to localStorage when updated
-  useEffect(() => {
-    if (user && events) {
-      localStorage.setItem(`events_${user.username}`, JSON.stringify(events));
-    }
-  }, [events, user]);
-  
-  const handleInputChange = (e) => {
-    setInputText(e.target.value);
-  };
-  
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && inputText.trim()) {
-      handleSubmit();
-    }
-  };
-  
-  const handleSubmit = async () => {
-    if (!inputText.trim() || isProcessing) return;
-    
-    // Add user message to chat
-    setChatHistory(prev => [
-      ...prev,
-      { sender: 'user', text: inputText }
-    ]);
-    
-    setIsProcessing(true);
-    
     try {
-      // Try using OpenAI service first
-      let processedEvent;
-      try {
-        processedEvent = await openAIService.parseEventText(inputText);
-        console.log("OpenAI response:", processedEvent); // Debug log
-      } catch (openAIError) {
-        console.error("OpenAI service failed:", openAIError);
-        // Fall back to local parsing
-        processedEvent = parseEventText(inputText);
-        console.log("Fallback parsing:", processedEvent); // Debug log
-      }
-      
-      if (processedEvent.action === 'cancel') {
-        // Find events with matching title
-        const eventTitle = processedEvent.title;
-        const matchingEvents = events.filter(event => 
-          event.title.toLowerCase().includes(eventTitle.toLowerCase())
-        );
-        
-        if (matchingEvents.length > 0) {
-          // Remove the matching events
-          const updatedEvents = events.filter(event => 
-            !event.title.toLowerCase().includes(eventTitle.toLowerCase())
-          );
-          setEvents(updatedEvents);
-          
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `Removed ${matchingEvents.length} event(s) with the title "${eventTitle}".`
-            }
-          ]);
-        } else {
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `I couldn't find any events matching "${eventTitle}" to cancel.`
-            }
-          ]);
-        }
+      const savedEvents = JSON.parse(localStorage.getItem(eventKey) || '[]');
+      setEvents(savedEvents.map((event, index) => toCalendarEvent(event, `saved-${index}`)));
+    } catch (error) {
+      console.error('Could not load saved events:', error);
+      setEvents([]);
+    }
+
+    try {
+      const savedJournal = JSON.parse(localStorage.getItem(journalKey) || '[]');
+      setJournalEntries(Array.isArray(savedJournal) ? savedJournal : []);
+    } catch (error) {
+      console.error('Could not load journal:', error);
+      setJournalEntries([]);
+    }
+  }, [eventKey, journalKey]);
+
+  useEffect(() => {
+    localStorage.setItem(eventKey, JSON.stringify(events));
+  }, [events, eventKey]);
+
+  useEffect(() => {
+    localStorage.setItem(journalKey, JSON.stringify(journalEntries));
+  }, [journalEntries, journalKey]);
+
+  const learnedDays = useMemo(
+    () => new Set(journalEntries.map((entry) => entry.date).filter(Boolean)).size,
+    [journalEntries]
+  );
+
+  const addEvents = (incoming) => {
+    const now = Date.now();
+    const normalized = incoming
+      .map((event, index) => toCalendarEvent(event, `ai-${now}-${index}`))
+      .filter((event) => !Number.isNaN(event.start.getTime()) && !Number.isNaN(event.end.getTime()));
+
+    setEvents((previous) => [...previous, ...normalized]);
+  };
+
+  const saveJournal = (entry) => {
+    setJournalEntries((previous) => {
+      const withoutToday = previous.filter((item) => item.date !== entry.date);
+      return [entry, ...withoutToday].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    });
+  };
+
+  const cancelMatching = (query) => {
+    const normalized = query.toLowerCase().trim();
+    if (!normalized) return 0;
+
+    const matching = events.filter((event) =>
+      event.title.toLowerCase().includes(normalized) ||
+      normalized.includes(event.title.toLowerCase())
+    );
+
+    if (!matching.length) return 0;
+
+    const ids = new Set(matching.map((event) => event.id));
+    setEvents((previous) => previous.filter((event) => !ids.has(event.id)));
+    return matching.length;
+  };
+
+  const handleSubmit = async () => {
+    const message = inputText.trim();
+    if (!message || isProcessing) return;
+
+    setChatHistory((previous) => [...previous, { sender: 'user', text: message }]);
+    setInputText('');
+    setIsProcessing(true);
+
+    try {
+      const result = await api.planRequest(message, events);
+
+      if (result.action === 'cancel') {
+        const count = cancelMatching(result.cancellation_query || message);
+        setChatHistory((previous) => [
+          ...previous,
+          {
+            sender: 'assistant',
+            text: count
+              ? `Removed ${count} matching calendar item(s).`
+              : `I could not find a calendar item matching "${result.cancellation_query || message}".`,
+          },
+        ]);
       } else {
-        // Handle event creation
-        const newEvent = {
-          id: Date.now(),
-          title: processedEvent.title || inputText, // Fallback to input if no title
-          start: processedEvent.start,
-          end: processedEvent.end,
-          location: processedEvent.location || '',
-          notes: processedEvent.notes || ''
-        };
-        
-        setEvents(prev => [...prev, newEvent]);
-        
-        // Format the dates for display
-        const startFormatted = format(newEvent.start, 'EEEE, MMMM d, yyyy h:mm a');
-        const endFormatted = format(newEvent.end, 'h:mm a');
-        
-        setChatHistory(prev => [
-          ...prev,
-          { 
-            sender: 'assistant', 
-            text: `Added "${newEvent.title}" to your calendar on ${startFormatted} to ${endFormatted}.`
-          }
+        addEvents(result.scheduled_events || []);
+
+        const scheduledCount = result.scheduled_events?.length || 0;
+        const conflictCount = result.conflicts?.length || 0;
+        const unscheduledCount = result.unscheduled?.length || 0;
+
+        const details = [
+          result.assistant_message,
+          scheduledCount ? `Scheduled ${scheduledCount} item(s).` : '',
+          conflictCount ? `${conflictCount} conflict(s) need attention.` : '',
+          unscheduledCount ? `${unscheduledCount} item(s) could not be placed automatically.` : '',
+        ].filter(Boolean).join(' ');
+
+        setChatHistory((previous) => [
+          ...previous,
+          {
+            sender: 'assistant',
+            text: details || 'I updated your plan.',
+          },
         ]);
       }
     } catch (error) {
-      console.error('Error processing event:', error);
-      
-      // Try one more time with the original parsing function
-      try {
-        const fallbackEvent = parseEventText(inputText);
-        
-        if (fallbackEvent.action !== 'cancel') {
-          const newEvent = {
-            id: Date.now(),
-            title: fallbackEvent.title,
-            start: fallbackEvent.start,
-            end: fallbackEvent.end
-          };
-          
-          setEvents(prev => [...prev, newEvent]);
-          
-          const startFormatted = format(newEvent.start, 'EEEE, MMMM d, yyyy h:mm a');
-          const endFormatted = format(newEvent.end, 'h:mm a');
-          
-          setChatHistory(prev => [
-            ...prev,
-            { 
-              sender: 'assistant', 
-              text: `Added "${newEvent.title}" to your calendar on ${startFormatted} to ${endFormatted}.`
-            }
-          ]);
-        }
-      } catch (fallbackError) {
-        console.error('Fallback parsing also failed:', fallbackError);
-        setChatHistory(prev => [
-          ...prev,
-          { 
-            sender: 'assistant', 
-            text: 'Sorry, I had trouble understanding that. Could you try rephrasing?'
-          }
-        ]);
-      }
+      console.error('Plan request failed:', error);
+      setChatHistory((previous) => [
+        ...previous,
+        {
+          sender: 'assistant',
+          text: error.response?.data?.error || 'I could not process that request. Please try again.',
+        },
+      ]);
     } finally {
       setIsProcessing(false);
-      setInputText('');
     }
   };
-  
-  // Handle calendar navigation and view changes
-  const handleNavigate = (newDate) => {
-    setDate(newDate);
-  };
-  
-  const handleViewChange = (newView) => {
-    setView(newView);
-  };
-  
-  // Clear all events function
+
   const clearAllEvents = () => {
     setEvents([]);
-    localStorage.removeItem(`events_${user.username}`);
-    setChatHistory(prev => [
-      ...prev,
-      { 
-        sender: 'assistant', 
-        text: 'All events have been cleared from your calendar.'
-      }
+    setChatHistory((previous) => [
+      ...previous,
+      { sender: 'assistant', text: 'All calendar items have been cleared.' },
     ]);
   };
-  
-  // Feature selection handler
-  const handleFeatureChange = (featureId) => {
-    setCurrentFeature(featureId);
-  };
-  
-  // Render the appropriate feature component based on selection
-  const renderFeature = () => {
-    switch (currentFeature) {
-      case 'calendar':
-        return (
-          <div className="flex-1 p-6 overflow-hidden">
-            {/* Calendar view */}
-            <div className="bg-white shadow-md rounded-lg p-4 h-full">
-              <div className="flex justify-between items-center mb-4">
-                <h1 className="text-2xl font-bold">
-                  {user ? `${user.firstName}'s Calendar` : 'My Calendar'}
-                </h1>
-                <button 
-                  className="btn btn-secondary btn-sm"
-                  onClick={clearAllEvents}
-                >
-                  Clear All Events
-                </button>
-              </div>
-              <Calendar
-                localizer={momentLocalizer(moment)}
-                events={events}
-                startAccessor="start"
-                endAccessor="end"
-                style={{ height: 'calc(100% - 40px)' }}
-                views={['month', 'week', 'day']}
-                view={view}
-                date={date}
-                onNavigate={handleNavigate}
-                onView={handleViewChange}
-                popup
-              />
-            </div>
-          </div>
-        );
-      
-      case 'habits':
-        return <HabitRecommendations />;
-      
-      case 'group':
-        return <GroupAvailability />;
-      
-      case 'tasks':
-        return <AutoTaskScheduler events={events} />;
-      
-      default:
-        return <div>Feature not found</div>;
+
+  const eventStyleGetter = (event) => {
+    if (event.conflict) {
+      return {
+        style: {
+          backgroundColor: '#DC2626',
+          borderRadius: '6px',
+          border: 'none',
+        },
+      };
     }
+
+    if (event.kind === 'task') {
+      return {
+        style: {
+          backgroundColor: '#4F46E5',
+          borderRadius: '6px',
+          border: 'none',
+        },
+      };
+    }
+
+    return {
+      style: {
+        backgroundColor: '#0F766E',
+        borderRadius: '6px',
+        border: 'none',
+      },
+    };
   };
-    
-  return (
-    <div className="flex flex-col h-screen">
-      <SmartEventEntryHeader 
-        user={user} 
-        logoutUser={logoutUser} 
-        membership={membership} 
-        currentFeature={currentFeature}
-        onFeatureChange={handleFeatureChange}
-      />
-      
-      {renderFeature()}
-      
-      {/* Only show chat interface for calendar feature */}
-      {currentFeature === 'calendar' && (
-        <div className="bg-white shadow-md h-72 border-t">
-          <div className="flex flex-col h-full">
-            <div className="flex-1 p-4 overflow-y-auto">
-              {chatHistory.map((message, index) => (
-                <div
-                  key={index}
-                  className={`mb-3 ${
-                    message.sender === 'user' ? 'text-right' : 'text-left'
-                  }`}
-                >
-                  <div
-                    className={`inline-block p-3 rounded-lg ${
-                      message.sender === 'user'
-                        ? 'bg-primary text-white'
-                        : 'bg-secondary text-gray-800'
-                    }`}
-                  >
-                    {message.text}
-                  </div>
-                </div>
-              ))}
+
+  const renderCalendar = () => (
+    <div className="flex min-h-0 flex-1 flex-col bg-gray-50">
+      <div className="flex-1 min-h-0 p-4 sm:p-6">
+        <div className="flex h-full min-h-[520px] flex-col rounded-2xl bg-white p-4 shadow-sm">
+          <div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+            <div>
+              <p className="text-sm font-medium text-indigo-600">Time Manager</p>
+              <h2 className="text-2xl font-bold text-gray-900">
+                {user?.firstName ? `${user.firstName}'s Calendar` : 'My Calendar'}
+              </h2>
+              <p className="mt-1 text-xs text-gray-500">
+                {learnedDays < 7
+                  ? `PlanWise is learning your routine: ${learnedDays}/7 journal days`
+                  : 'Personalized daily planning is unlocked'}
+              </p>
             </div>
-            <div className="p-4 border-t flex">
-              <input
-                type="text"
-                className="flex-1 mr-2 input"
-                placeholder="Add or cancel an event..."
-                value={inputText}
-                onChange={handleInputChange}
-                onKeyPress={handleKeyPress}
-                disabled={isProcessing}
-              />
-              <button
-                className={`btn btn-primary ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
-                onClick={handleSubmit}
-                disabled={!inputText.trim() || isProcessing}
-              >
-                {isProcessing ? 'Processing...' : 'Send'}
-              </button>
-            </div>
+            <button className="btn btn-secondary btn-sm" onClick={clearAllEvents}>
+              Clear calendar
+            </button>
+          </div>
+
+          <div className="min-h-0 flex-1">
+            <Calendar
+              localizer={localizer}
+              events={events}
+              startAccessor="start"
+              endAccessor="end"
+              style={{ height: '100%' }}
+              views={['month', 'week', 'day']}
+              view={view}
+              date={date}
+              onNavigate={setDate}
+              onView={setView}
+              eventPropGetter={eventStyleGetter}
+              popup
+            />
           </div>
         </div>
+      </div>
+
+      <div className="border-t bg-white shadow-lg">
+        <div className="mx-auto max-w-7xl p-4">
+          <div className="mb-3 max-h-40 space-y-2 overflow-y-auto">
+            {chatHistory.slice(-5).map((message, index) => (
+              <div
+                key={index}
+                className={message.sender === 'user' ? 'text-right' : 'text-left'}
+              >
+                <div
+                  className={`inline-block max-w-3xl rounded-xl px-3 py-2 text-sm ${
+                    message.sender === 'user'
+                      ? 'bg-primary text-white'
+                      : 'bg-gray-100 text-gray-800'
+                  }`}
+                >
+                  {message.text}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex gap-2">
+            <textarea
+              className="input min-h-[46px] flex-1 resize-none"
+              rows="1"
+              placeholder="e.g. 周五下午3点去看医生，路上40分钟，上午还要交作业，帮我安排一下"
+              value={inputText}
+              onChange={(event) => setInputText(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  handleSubmit();
+                }
+              }}
+              disabled={isProcessing}
+            />
+            <button
+              className={`btn btn-primary self-end ${isProcessing ? 'cursor-not-allowed opacity-50' : ''}`}
+              onClick={handleSubmit}
+              disabled={isProcessing || !inputText.trim()}
+            >
+              {isProcessing ? 'Planning...' : 'Plan'}
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-gray-400">
+            Tasks are placed into open time. Fixed-time conflicts are shown in red instead of silently overwritten.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex h-screen flex-col">
+      <SmartEventEntryHeader
+        user={user}
+        logoutUser={logoutUser}
+        membership={membership}
+        currentFeature={currentFeature}
+        onFeatureChange={setCurrentFeature}
+      />
+
+      {currentFeature === 'calendar' && renderCalendar()}
+      {currentFeature === 'journal' && (
+        <DailyJournal entries={journalEntries} onSave={saveJournal} />
+      )}
+      {currentFeature === 'today' && (
+        <TodayPlan
+          events={events}
+          journalEntries={journalEntries}
+          onAddEvents={addEvents}
+          membership={membership}
+        />
       )}
     </div>
   );
