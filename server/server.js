@@ -1,223 +1,781 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const { Configuration, OpenAIApi } = require('openai');
+const stripeFactory = require('stripe');
 
 const app = express();
 const port = process.env.PORT || 4000;
+const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+const openaiModel = process.env.OPENAI_MODEL || 'gpt-5.6-luna';
 
-// Initialize OpenAI
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-const openai = new OpenAIApi(configuration);
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? stripeFactory(process.env.STRIPE_SECRET_KEY)
+  : null;
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
+app.use(cors({
+  origin: clientUrl,
+  credentials: true,
+}));
+app.use(express.json({ limit: '1mb' }));
 
-// Price IDs for different plans
 const PRICE_IDS = {
-  MONTHLY: process.env.STRIPE_PRICE_ID_MONTHLY,
-  LIFETIME: process.env.STRIPE_PRICE_ID_LIFETIME
+  premium: process.env.STRIPE_PRICE_ID_MONTHLY || '',
+  lifetime: process.env.STRIPE_PRICE_ID_LIFETIME || '',
 };
 
-// Stripe payment endpoint
-app.post('/api/create-payment-intent', async (req, res) => {
-  const { priceId } = req.body;
-  
-  try {
-    // Create a PaymentIntent
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: priceId === PRICE_IDS.MONTHLY ? 500 : 8000, // $5 or $80 in cents
-      currency: 'usd',
-      metadata: {
-        priceId: priceId
+function pad(value) {
+  return String(value).padStart(2, '0');
+}
+
+function parseFloating(value) {
+  if (!value || typeof value !== 'string') return null;
+  const clean = value.replace('Z', '').slice(0, 16);
+  const parts = clean.split('T');
+  const dateParts = parts[0].split('-').map(Number);
+  const timeParts = (parts[1] || '00:00').split(':').map(Number);
+
+  if (dateParts.length !== 3 || dateParts.some(Number.isNaN)) return null;
+
+  return new Date(Date.UTC(
+    dateParts[0],
+    dateParts[1] - 1,
+    dateParts[2],
+    timeParts[0] || 0,
+    timeParts[1] || 0,
+    0,
+    0
+  ));
+}
+
+function formatFloating(date) {
+  return [
+    date.getUTCFullYear(),
+    '-',
+    pad(date.getUTCMonth() + 1),
+    '-',
+    pad(date.getUTCDate()),
+    'T',
+    pad(date.getUTCHours()),
+    ':',
+    pad(date.getUTCMinutes()),
+    ':00',
+  ].join('');
+}
+
+function dateOnly(date) {
+  return [
+    date.getUTCFullYear(),
+    '-',
+    pad(date.getUTCMonth() + 1),
+    '-',
+    pad(date.getUTCDate()),
+  ].join('');
+}
+
+function addMinutes(date, minutes) {
+  return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function setUtcTime(date, hour, minute) {
+  const copy = new Date(date.getTime());
+  copy.setUTCHours(hour, minute, 0, 0);
+  return copy;
+}
+
+function sameFloatingDay(a, b) {
+  return dateOnly(a) === dateOnly(b);
+}
+
+function extractResponseText(data) {
+  if (!data) return '';
+  if (typeof data.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text;
+  }
+
+  const output = Array.isArray(data.output) ? data.output : [];
+  for (const item of output) {
+    const content = Array.isArray(item.content) ? item.content : [];
+    for (const part of content) {
+      if (part && part.type === 'output_text' && typeof part.text === 'string') {
+        return part.text;
       }
+    }
+  }
+
+  return '';
+}
+
+async function callStructuredAI(name, schema, instructions, input) {
+  if (!process.env.OPENAI_API_KEY) return null;
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + process.env.OPENAI_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: openaiModel,
+      instructions,
+      input: JSON.stringify(input),
+      text: {
+        format: {
+          type: 'json_schema',
+          name,
+          strict: true,
+          schema,
+        },
+      },
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const message = data && data.error && data.error.message
+      ? data.error.message
+      : 'OpenAI request failed';
+    throw new Error(message);
+  }
+
+  const text = extractResponseText(data);
+  if (!text) throw new Error('OpenAI returned an empty response');
+
+  return JSON.parse(text);
+}
+
+function nextWeekday(reference, targetDay) {
+  const currentDay = reference.getUTCDay();
+  let delta = targetDay - currentDay;
+  if (delta <= 0) delta += 7;
+  return addDays(reference, delta);
+}
+
+function inferDateFromText(text, reference) {
+  const lower = text.toLowerCase();
+
+  if (/\b(today)\b/.test(lower) || /今天/.test(text)) return dateOnly(reference);
+  if (/\b(tomorrow)\b/.test(lower) || /明天/.test(text)) return dateOnly(addDays(reference, 1));
+  if (/后天/.test(text)) return dateOnly(addDays(reference, 2));
+
+  const weekdays = [
+    { index: 0, patterns: ['sunday', 'sun', '周日', '星期日', '周天', '星期天'] },
+    { index: 1, patterns: ['monday', 'mon', '周一', '星期一'] },
+    { index: 2, patterns: ['tuesday', 'tue', '周二', '星期二'] },
+    { index: 3, patterns: ['wednesday', 'wed', '周三', '星期三'] },
+    { index: 4, patterns: ['thursday', 'thu', '周四', '星期四'] },
+    { index: 5, patterns: ['friday', 'fri', '周五', '星期五'] },
+    { index: 6, patterns: ['saturday', 'sat', '周六', '星期六'] },
+  ];
+
+  for (const weekday of weekdays) {
+    if (weekday.patterns.some((pattern) => lower.includes(pattern) || text.includes(pattern))) {
+      return dateOnly(nextWeekday(reference, weekday.index));
+    }
+  }
+
+  const isoDate = text.match(/\b(20\d{2})[-\/.](\d{1,2})[-\/.](\d{1,2})\b/);
+  if (isoDate) {
+    return isoDate[1] + '-' + pad(isoDate[2]) + '-' + pad(isoDate[3]);
+  }
+
+  const cnDate = text.match(/(\d{1,2})月(\d{1,2})[日号]?/);
+  if (cnDate) {
+    let year = reference.getUTCFullYear();
+    const candidate = new Date(Date.UTC(year, Number(cnDate[1]) - 1, Number(cnDate[2])));
+    if (candidate < setUtcTime(reference, 0, 0)) year += 1;
+    return year + '-' + pad(cnDate[1]) + '-' + pad(cnDate[2]);
+  }
+
+  return '';
+}
+
+function inferTimeFromText(text) {
+  const english = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (english) {
+    let hour = Number(english[1]);
+    const minute = Number(english[2] || 0);
+    const period = english[3].toLowerCase();
+    if (period === 'pm' && hour < 12) hour += 12;
+    if (period === 'am' && hour === 12) hour = 0;
+    return pad(hour) + ':' + pad(minute);
+  }
+
+  const twentyFour = text.match(/\b([01]?\d|2[0-3])[:：](\d{2})\b/);
+  if (twentyFour) {
+    return pad(twentyFour[1]) + ':' + pad(twentyFour[2]);
+  }
+
+  const chinese = text.match(/(早上|上午|中午|下午|晚上)?\s*(\d{1,2})\s*点(?:\s*(半|\d{1,2})\s*分?)?/);
+  if (chinese) {
+    let hour = Number(chinese[2]);
+    let minute = chinese[3] === '半' ? 30 : Number(chinese[3] || 0);
+    const period = chinese[1] || '';
+    if ((period === '下午' || period === '晚上') && hour < 12) hour += 12;
+    if (period === '中午' && hour < 11) hour += 12;
+    return pad(hour) + ':' + pad(minute);
+  }
+
+  return '';
+}
+
+function inferDuration(text) {
+  const chinese = text.match(/(\d+(?:\.\d+)?)\s*(小时|分钟)/);
+  if (chinese) {
+    const amount = Number(chinese[1]);
+    return chinese[2] === '小时' ? Math.round(amount * 60) : Math.round(amount);
+  }
+
+  const english = text.match(/(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)/i);
+  if (english) {
+    const amount = Number(english[1]);
+    return /^h/i.test(english[2]) ? Math.round(amount * 60) : Math.round(amount);
+  }
+
+  return 60;
+}
+
+function fallbackPlanner(text, referenceLocal) {
+  const reference = parseFloating(referenceLocal) || new Date();
+  const lower = text.toLowerCase();
+
+  if (
+    lower.includes('cancel') ||
+    lower.includes('delete') ||
+    lower.includes('remove') ||
+    text.includes('取消') ||
+    text.includes('删除') ||
+    text.includes('移除')
+  ) {
+    return {
+      action: 'cancel',
+      cancellation_query: text
+        .replace(/cancel|delete|remove/gi, '')
+        .replace(/取消|删除|移除/g, '')
+        .trim(),
+      assistant_message: 'I will remove matching calendar items.',
+      items: [],
+    };
+  }
+
+  const date = inferDateFromText(text, reference);
+  const startTime = inferTimeFromText(text);
+  const duration = inferDuration(text);
+
+  return {
+    action: 'add',
+    cancellation_query: '',
+    assistant_message: 'I added the request using PlanWise fallback parsing.',
+    items: [{
+      title: text.trim(),
+      kind: startTime ? 'event' : 'task',
+      date,
+      start_time: startTime,
+      duration_min: duration,
+      deadline: '',
+      priority: 'medium',
+      flexible: !startTime,
+      location: '',
+      notes: '',
+    }],
+  };
+}
+
+function normalizeExistingEvents(events) {
+  return (Array.isArray(events) ? events : [])
+    .map((event) => {
+      const start = parseFloating(event.start);
+      const end = parseFloating(event.end);
+      if (!start || !end) return null;
+      return {
+        title: event.title || 'Busy',
+        start,
+        end,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.start - b.start);
+}
+
+function overlaps(start, end, interval) {
+  return start < interval.end && end > interval.start;
+}
+
+function findOpenSlot({
+  earliest,
+  durationMin,
+  deadline,
+  busy,
+  preferredTime,
+}) {
+  let candidate = new Date(earliest.getTime());
+  const maxSearch = deadline || addDays(candidate, 14);
+
+  if (preferredTime) {
+    const parts = preferredTime.split(':').map(Number);
+    if (parts.length >= 2 && parts.every((part) => !Number.isNaN(part))) {
+      const preferred = setUtcTime(candidate, parts[0], parts[1]);
+      if (preferred > candidate) candidate = preferred;
+    }
+  }
+
+  while (candidate < maxSearch) {
+    const dayStart = setUtcTime(candidate, 8, 0);
+    const dayEnd = setUtcTime(candidate, 21, 0);
+
+    if (candidate < dayStart) candidate = dayStart;
+
+    const proposedEnd = addMinutes(candidate, durationMin);
+    if (proposedEnd > dayEnd) {
+      candidate = setUtcTime(addDays(candidate, 1), 8, 0);
+      continue;
+    }
+
+    if (deadline && proposedEnd > deadline) return null;
+
+    const collision = busy.find((interval) => overlaps(candidate, proposedEnd, interval));
+    if (!collision) {
+      return { start: candidate, end: proposedEnd };
+    }
+
+    candidate = addMinutes(collision.end, 15);
+  }
+
+  return null;
+}
+
+function scheduleItems(items, existingEvents, referenceLocal) {
+  const reference = parseFloating(referenceLocal) || new Date();
+  const busy = normalizeExistingEvents(existingEvents);
+  const scheduled = [];
+  const conflicts = [];
+  const unscheduled = [];
+
+  const fixed = items.filter((item) => item.start_time);
+  const flexible = items
+    .filter((item) => !item.start_time)
+    .sort((a, b) => {
+      const score = { high: 3, medium: 2, low: 1 };
+      const priorityDiff = (score[b.priority] || 2) - (score[a.priority] || 2);
+      if (priorityDiff !== 0) return priorityDiff;
+      if (a.deadline && b.deadline) return a.deadline.localeCompare(b.deadline);
+      if (a.deadline) return -1;
+      if (b.deadline) return 1;
+      return 0;
     });
 
-    res.send({
-      clientSecret: paymentIntent.client_secret
+  fixed.forEach((item) => {
+    const targetDate = item.date || dateOnly(reference);
+    const start = parseFloating(targetDate + 'T' + item.start_time);
+    if (!start) {
+      unscheduled.push({ title: item.title, reason: 'Invalid start time' });
+      return;
+    }
+
+    const end = addMinutes(start, Math.max(15, item.duration_min || 60));
+    const collision = busy.find((interval) => overlaps(start, end, interval));
+
+    if (collision) {
+      conflicts.push({
+        title: item.title,
+        message: 'Conflicts with ' + collision.title,
+      });
+    }
+
+    scheduled.push({
+      title: item.title,
+      start: formatFloating(start),
+      end: formatFloating(end),
+      kind: item.kind || 'event',
+      priority: item.priority || 'medium',
+      location: item.location || '',
+      notes: item.notes || '',
+      conflict: Boolean(collision),
+      source: 'assistant',
     });
-  } catch (error) {
-    console.error('Error creating payment intent:', error);
-    res.status(500).send({ error: error.message });
-  }
+
+    busy.push({ title: item.title, start, end });
+    busy.sort((a, b) => a.start - b.start);
+  });
+
+  flexible.forEach((item) => {
+    const targetDate = item.date || dateOnly(reference);
+    const targetDay = parseFloating(targetDate + 'T00:00');
+    const earliest = sameFloatingDay(targetDay, reference)
+      ? new Date(Math.max(reference.getTime(), setUtcTime(reference, 8, 0).getTime()))
+      : setUtcTime(targetDay, 8, 0);
+
+    let deadline = null;
+    if (item.deadline) {
+      deadline = parseFloating(item.deadline);
+    } else if (item.date) {
+      deadline = setUtcTime(targetDay, 21, 0);
+    }
+
+    const slot = findOpenSlot({
+      earliest,
+      durationMin: Math.max(15, item.duration_min || 60),
+      deadline,
+      busy,
+      preferredTime: item.preferred_time || '',
+    });
+
+    if (!slot) {
+      unscheduled.push({
+        title: item.title,
+        reason: item.deadline
+          ? 'No available slot before the deadline'
+          : 'No available slot found in the search window',
+      });
+      return;
+    }
+
+    scheduled.push({
+      title: item.title,
+      start: formatFloating(slot.start),
+      end: formatFloating(slot.end),
+      kind: 'task',
+      priority: item.priority || 'medium',
+      location: item.location || '',
+      notes: item.notes || '',
+      conflict: false,
+      source: 'assistant',
+    });
+
+    busy.push({ title: item.title, start: slot.start, end: slot.end });
+    busy.sort((a, b) => a.start - b.start);
+  });
+
+  return { scheduled, conflicts, unscheduled };
+}
+
+const plannerSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    action: { type: 'string', enum: ['add', 'cancel'] },
+    cancellation_query: { type: 'string' },
+    assistant_message: { type: 'string' },
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          kind: { type: 'string', enum: ['event', 'task'] },
+          date: { type: 'string' },
+          start_time: { type: 'string' },
+          duration_min: { type: 'integer', minimum: 15, maximum: 720 },
+          deadline: { type: 'string' },
+          priority: { type: 'string', enum: ['low', 'medium', 'high'] },
+          flexible: { type: 'boolean' },
+          location: { type: 'string' },
+          notes: { type: 'string' },
+        },
+        required: [
+          'title',
+          'kind',
+          'date',
+          'start_time',
+          'duration_min',
+          'deadline',
+          'priority',
+          'flexible',
+          'location',
+          'notes',
+        ],
+      },
+    },
+  },
+  required: ['action', 'cancellation_query', 'assistant_message', 'items'],
+};
+
+const suggestionsSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    summary: { type: 'string' },
+    suggestions: {
+      type: 'array',
+      minItems: 3,
+      maxItems: 5,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          duration_min: { type: 'integer', minimum: 15, maximum: 240 },
+          priority: { type: 'string', enum: ['low', 'medium', 'high'] },
+          preferred_time: { type: 'string' },
+          reason: { type: 'string' },
+          category: { type: 'string' },
+        },
+        required: [
+          'title',
+          'duration_min',
+          'priority',
+          'preferred_time',
+          'reason',
+          'category',
+        ],
+      },
+    },
+  },
+  required: ['summary', 'suggestions'],
+};
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    aiConfigured: Boolean(process.env.OPENAI_API_KEY),
+    stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
+    model: openaiModel,
+  });
 });
 
-// Stripe checkout session endpoint (alternative approach)
+app.post('/api/plan-request', async (req, res) => {
+  const text = typeof req.body.text === 'string' ? req.body.text.trim() : '';
+  const referenceLocal = req.body.referenceLocal || '';
+  const timezone = req.body.timezone || 'local';
+  const existingEvents = Array.isArray(req.body.events) ? req.body.events : [];
+
+  if (!text) {
+    return res.status(400).json({ error: 'text is required' });
+  }
+
+  const instructions = [
+    'You are PlanWise, an AI calendar and time-management assistant.',
+    'Extract every distinct appointment, event, task, deadline, travel block, and cancellation request from the user message.',
+    'The user may mix Chinese and English.',
+    'Use the provided reference local datetime and timezone for relative dates.',
+    'For fixed appointments, provide date as YYYY-MM-DD and start_time as HH:mm.',
+    'For flexible tasks, leave start_time empty and provide a deadline only when the user states or clearly implies one.',
+    'Deadline format must be YYYY-MM-DDTHH:mm:00 or an empty string.',
+    'Do not invent obligations. When duration is missing, estimate a conservative duration between 30 and 90 minutes.',
+    'If travel time is explicitly mentioned, create a separate task/event for it so the scheduler can reserve the time.',
+    'Return action=cancel only when the user is asking to remove an existing calendar item.',
+    'Keep assistant_message concise and useful.',
+  ].join(' ');
+
+  let extracted;
+
+  try {
+    extracted = await callStructuredAI(
+      'planwise_planner',
+      plannerSchema,
+      instructions,
+      {
+        text,
+        referenceLocal,
+        timezone,
+        existingEvents,
+      }
+    );
+  } catch (error) {
+    console.error('AI planner failed, using fallback:', error.message);
+  }
+
+  if (!extracted) {
+    extracted = fallbackPlanner(text, referenceLocal);
+  }
+
+  if (extracted.action === 'cancel') {
+    return res.json({
+      action: 'cancel',
+      cancellation_query: extracted.cancellation_query,
+      assistant_message: extracted.assistant_message,
+      extracted_items: [],
+      scheduled_events: [],
+      conflicts: [],
+      unscheduled: [],
+    });
+  }
+
+  const result = scheduleItems(extracted.items || [], existingEvents, referenceLocal);
+
+  return res.json({
+    action: 'add',
+    cancellation_query: '',
+    assistant_message: extracted.assistant_message,
+    extracted_items: extracted.items || [],
+    scheduled_events: result.scheduled,
+    conflicts: result.conflicts,
+    unscheduled: result.unscheduled,
+  });
+});
+
+app.post('/api/daily-suggestions', async (req, res) => {
+  const journalEntries = Array.isArray(req.body.journalEntries)
+    ? req.body.journalEntries
+    : [];
+  const events = Array.isArray(req.body.events) ? req.body.events : [];
+  const today = req.body.today || '';
+  const referenceLocal = req.body.referenceLocal || (today ? today + 'T08:00:00' : '');
+  const timezone = req.body.timezone || 'local';
+
+  const uniqueDays = new Set(journalEntries.map((entry) => entry.date).filter(Boolean));
+  if (uniqueDays.size < 7) {
+    return res.status(400).json({
+      error: 'PlanWise needs at least 7 journal days before generating daily suggestions.',
+      learnedDays: uniqueDays.size,
+    });
+  }
+
+  const recentEntries = journalEntries
+    .slice()
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+    .slice(0, 14);
+
+  const instructions = [
+    'You are PlanWise, a personalized daily planning assistant.',
+    'Infer routine patterns only from the supplied journal and schedule history.',
+    'Generate 3 to 5 optional, concrete tasks for today that fit the user schedule and observed habits.',
+    'Do not invent meetings, deadlines, medical needs, or external obligations.',
+    'Prefer realistic self-management tasks such as focused work, study, exercise, planning, admin, breaks, or reflection when supported by the history.',
+    'preferred_time must be HH:mm or an empty string.',
+    'Keep each reason to one short sentence.',
+  ].join(' ');
+
+  let generated;
+
+  try {
+    generated = await callStructuredAI(
+      'planwise_daily_suggestions',
+      suggestionsSchema,
+      instructions,
+      {
+        today,
+        timezone,
+        journalEntries: recentEntries,
+        events,
+      }
+    );
+  } catch (error) {
+    console.error('Daily suggestion AI failed, using fallback:', error.message);
+  }
+
+  if (!generated) {
+    generated = {
+      summary: 'PlanWise is using a simple local routine until an OpenAI key is configured.',
+      suggestions: [
+        {
+          title: 'Top-priority focus block',
+          duration_min: 60,
+          priority: 'high',
+          preferred_time: '09:00',
+          reason: 'Protect a focused block for the most important task of the day.',
+          category: 'focus',
+        },
+        {
+          title: 'Admin and follow-up block',
+          duration_min: 30,
+          priority: 'medium',
+          preferred_time: '14:00',
+          reason: 'Batch small tasks so they do not fragment your focus time.',
+          category: 'admin',
+        },
+        {
+          title: 'Daily review',
+          duration_min: 20,
+          priority: 'low',
+          preferred_time: '20:00',
+          reason: 'Close the loop by reviewing what was completed and what should move forward.',
+          category: 'reflection',
+        },
+      ],
+    };
+  }
+
+  const taskItems = generated.suggestions.map((suggestion) => ({
+    title: suggestion.title,
+    kind: 'task',
+    date: today,
+    start_time: '',
+    duration_min: suggestion.duration_min,
+    deadline: '',
+    priority: suggestion.priority,
+    flexible: true,
+    preferred_time: suggestion.preferred_time,
+    location: '',
+    notes: suggestion.reason,
+  }));
+
+  const schedule = scheduleItems(taskItems, events, referenceLocal);
+
+  return res.json({
+    summary: generated.summary,
+    suggestions: generated.suggestions,
+    scheduled_events: schedule.scheduled,
+    conflicts: schedule.conflicts,
+    unscheduled: schedule.unscheduled,
+  });
+});
+
 app.post('/api/create-checkout-session', async (req, res) => {
-  const { priceId } = req.body;
-  
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe is not configured on the server.' });
+  }
+
+  const plan = req.body.plan;
+  if (!['premium', 'lifetime'].includes(plan)) {
+    return res.status(400).json({ error: 'Invalid plan.' });
+  }
+
+  const priceId = PRICE_IDS[plan];
+  if (!priceId) {
+    return res.status(500).json({ error: 'Stripe price ID is missing for ' + plan + '.' });
+  }
+
   try {
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
-      mode: priceId === PRICE_IDS.MONTHLY ? 'subscription' : 'payment',
-      success_url: `${process.env.CLIENT_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/membership`,
+      mode: plan === 'premium' ? 'subscription' : 'payment',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url:
+        clientUrl +
+        '/payment/success?session_id={CHECKOUT_SESSION_ID}&plan=' +
+        encodeURIComponent(plan),
+      cancel_url: clientUrl + '/membership',
+      metadata: { plan },
     });
 
-    res.send({ sessionId: session.id });
+    return res.json({
+      sessionId: session.id,
+      url: session.url,
+    });
   } catch (error) {
-    console.error('Error creating checkout session:', error);
-    res.status(500).send({ error: error.message });
+    console.error('Stripe checkout session failed:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// OpenAI API Routes
-
-// Parse natural language into calendar events
-// In server.js, update the parse-event endpoint
-app.post('/api/parse-event', async (req, res) => {
-  const { text } = req.body;
-  
-  if (!text) {
-    return res.status(400).json({ error: 'Text is required' });
+app.get('/api/checkout-session/:sessionId', async (req, res) => {
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe is not configured on the server.' });
   }
-  
+
   try {
-    const response = await openai.createChatCompletion({
-      model: "gpt-4",
-      messages: [
-        {
-          role: "system",
-          content: `You are an intelligent calendar assistant that extracts event details from natural language.
-          
-          INSTRUCTIONS:
-          1. Extract the event title (make it concise and descriptive)
-          2. Determine the date and time (use context clues for relative dates)
-          3. Estimate the event duration based on the type of event
-          4. Extract any location information
-          5. Extract any additional notes
-          
-          FORMAT RULES:
-          - For dinner events without specific times, default to 7:00 PM
-          - For lunch events without specific times, default to 12:00 PM
-          - For meetings without specific times, default to 1 hour duration
-          - For coffee meetings, default to 30 minutes
-          - If no specific date is mentioned but "tomorrow" is used, set the date to tomorrow
-          - If no specific date is mentioned but "next [weekday]" is used, set the date to the next occurrence of that weekday
-          - The event title should be concise and descriptive, not the entire input text
-          
-          EXAMPLES:
-          - Input: "I will have dinner with Tiga tomorrow night"
-            Output: { "title": "Dinner with Tiga", "startTime": "2023-04-28T19:00:00", "endTime": "2023-04-28T20:30:00", "location": "", "notes": "" }
-          
-          - Input: "Meeting with marketing team at 3pm on Friday"
-            Output: { "title": "Marketing Team Meeting", "startTime": "2023-04-28T15:00:00", "endTime": "2023-04-28T16:00:00", "location": "", "notes": "" }
-          
-          Respond with a JSON object containing title, startTime, endTime, location, and notes.`
-        },
-        {
-          role: "user",
-          content: `Parse this event: "${text}"`
-        }
-      ],
-      response_format: { type: "json_object" }
-    });
-    
-    // Parse the response
-    const result = JSON.parse(response.data.choices[0].message.content);
-    
-    res.json({
-      title: result.title,
-      start: result.startTime,
-      end: result.endTime,
-      notes: result.notes || '',
-      location: result.location || '',
+    const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+    return res.json({
+      id: session.id,
+      status: session.status,
+      paymentStatus: session.payment_status,
+      plan: session.metadata && session.metadata.plan ? session.metadata.plan : '',
+      verified:
+        session.status === 'complete' &&
+        (session.payment_status === 'paid' || session.mode === 'subscription'),
     });
   } catch (error) {
-    console.error('Error parsing event:', error);
-    res.status(500).json({
-      error: 'Failed to parse event text',
-      details: error.message
-    });
+    console.error('Stripe session verification failed:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// Generate optimal task schedule
-app.post('/api/schedule-tasks', async (req, res) => {
-  const { tasks } = req.body;
-  
-  if (!tasks || !Array.isArray(tasks)) {
-    return res.status(400).json({ error: 'Valid tasks array is required' });
-  }
-  
-  try {
-    const response = await openai.createChatCompletion({
-      model: "gpt-4",
-      messages: [
-        {
-          role: "system",
-          content: "You are a scheduling assistant that creates optimal schedules based on task priorities, deadlines, and time constraints. Generate a schedule that maximizes productivity."
-        },
-        {
-          role: "user",
-          content: `Generate an optimal schedule for these tasks: ${JSON.stringify(tasks)}`
-        }
-      ],
-      response_format: { type: "json_object" }
-    });
-    
-    // Parse the response
-    const result = JSON.parse(response.data.choices[0].message.content);
-    
-    res.json({ schedule: result.schedule });
-  } catch (error) {
-    console.error('Error scheduling tasks:', error);
-    res.status(500).json({
-      error: 'Failed to generate task schedule',
-      details: error.message
-    });
-  }
-});
-
-// Generate personalized recommendations
-app.post('/api/generate-recommendations', async (req, res) => {
-  const { moodEntries, activityEntries } = req.body;
-  
-  if (!moodEntries || !activityEntries) {
-    return res.status(400).json({ error: 'Mood and activity entries are required' });
-  }
-  
-  try {
-    const response = await openai.createChatCompletion({
-      model: "gpt-4",
-      messages: [
-        {
-          role: "system",
-          content: "You are a lifestyle coach that provides personalized daily routine recommendations based on mood patterns and activity history. Your goal is to suggest routines that improve well-being and productivity."
-        },
-        {
-          role: "user",
-          content: `Generate personalized recommendations based on this mood history: ${JSON.stringify(moodEntries)} and activity history: ${JSON.stringify(activityEntries)}`
-        }
-      ],
-      response_format: { type: "json_object" }
-    });
-    
-    // Parse the response
-    const result = JSON.parse(response.data.choices[0].message.content);
-    
-    res.json({ recommendations: result.recommendations });
-  } catch (error) {
-    console.error('Error generating recommendations:', error);
-    res.status(500).json({
-      error: 'Failed to generate recommendations',
-      details: error.message
-    });
-  }
-});
-
-// Start server
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log('PlanWise server running on port ' + port);
 });
