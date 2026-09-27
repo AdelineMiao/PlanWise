@@ -1,78 +1,74 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 
-// In SmartEventEntryHeader.js, add navigation links
 function SmartEventEntryHeader({ user, logoutUser, membership, currentFeature, onFeatureChange }) {
   const navigate = useNavigate();
-  
+
   const handleLogout = () => {
     logoutUser();
     navigate('/');
   };
-  
+
   const features = [
-    { id: 'calendar', name: 'Smart Event Entry' },
-    { id: 'habits', name: 'Habit Recommendations', premium: true },
-    { id: 'group', name: 'Group Availability', premium: true },
-    { id: 'tasks', name: 'Auto Task Scheduler', premium: true }
+    { id: 'calendar', name: 'Calendar' },
+    { id: 'journal', name: 'Daily Journal' },
+    { id: 'today', name: 'Today Plan', premium: true },
   ];
-  
+
   return (
     <div className="bg-white shadow-sm">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
         <div className="flex flex-col">
-          <div className="flex justify-between h-16 items-center">
+          <div className="flex h-16 items-center justify-between gap-4">
             <div className="flex items-center">
               <h1 className="text-xl font-bold text-primary">
                 Plan<span className="text-gray-900">Wise</span>
               </h1>
+              <span className="ml-3 hidden rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700 sm:inline">
+                AI Calendar Assistant
+              </span>
             </div>
-            <div className="flex items-center">
+
+            <div className="flex items-center gap-3">
               {membership === 'basic' && (
                 <button
                   onClick={() => navigate('/membership')}
-                  className="mr-4 text-sm bg-green-50 text-green-700 px-3 py-1 rounded hover:bg-green-100 transition"
+                  className="hidden rounded-md bg-green-50 px-3 py-1 text-sm text-green-700 transition hover:bg-green-100 sm:block"
                 >
-                  Upgrade Membership
+                  Upgrade
                 </button>
               )}
-              <span className="mr-4 text-sm text-gray-600">
-                {membership === 'basic' ? 'Basic Plan' : membership === 'premium' ? 'Premium Plan' : 'Lifetime Plan'}
+              <span className="hidden text-sm text-gray-500 md:block">
+                {membership === 'basic' ? 'Basic' : membership === 'premium' ? 'Premium' : 'Lifetime'}
               </span>
-              <div className="mr-4 font-medium text-gray-800">
-                {user.firstName} {user.lastName}
+              <div className="hidden font-medium text-gray-800 sm:block">
+                {user?.firstName} {user?.lastName}
               </div>
-              <button
-                onClick={handleLogout}
-                className="btn btn-secondary btn-sm"
-              >
+              <button onClick={handleLogout} className="btn btn-secondary btn-sm">
                 Logout
               </button>
             </div>
           </div>
-          
-          {/* Feature navigation */}
-          <div className="flex space-x-4 py-2 border-b">
-            {features.map(feature => {
-              const isPremiumLocked = feature.premium && membership === 'basic';
-              
+
+          <div className="flex gap-2 overflow-x-auto border-b py-2">
+            {features.map((feature) => {
+              const locked = feature.premium && membership === 'basic';
+
               return (
                 <button
                   key={feature.id}
-                  className={`px-4 py-2 rounded-md ${
+                  className={`whitespace-nowrap rounded-md px-4 py-2 text-sm font-medium transition ${
                     currentFeature === feature.id
                       ? 'bg-primary text-white'
-                      : isPremiumLocked
-                      ? 'text-gray-400 cursor-not-allowed'
+                      : locked
+                      ? 'cursor-not-allowed text-gray-400'
                       : 'text-gray-700 hover:bg-gray-100'
                   }`}
-                  onClick={() => !isPremiumLocked && onFeatureChange(feature.id)}
-                  disabled={isPremiumLocked}
+                  onClick={() => !locked && onFeatureChange(feature.id)}
+                  disabled={locked}
                 >
                   {feature.name}
-                  {isPremiumLocked && (
-                    <span className="ml-1 text-xs">🔒</span>
-                  )}
+                  {locked && <span className="ml-1 text-xs">🔒</span>}
                 </button>
               );
             })}
